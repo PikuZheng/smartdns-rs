@@ -32,6 +32,9 @@ pub struct SmartDnsConfig {
     /// ```
     server_name: Option<Name>,
 
+    /// The number of worker threads
+    num_workers: Option<usize>,
+
     /// whether resolv local hostname to ip address
     resolv_hostname: Option<bool>,
 
@@ -403,15 +406,24 @@ impl SmartDnsConfig {
         .unwrap_or_else(|| Name::from_str(crate::NAME).unwrap())
     }
 
+    /// The number of worker threads
+    #[inline]
+    pub fn num_workers(&self) -> Option<usize> {
+        self.num_workers
+    }
+
     /// SSL Certificate file path
+    #[inline]
     pub fn bind_cert_file(&self) -> Option<&Path> {
         self.bind_cert_file.as_deref()
     }
     /// SSL Certificate key file path
+    #[inline]
     pub fn bind_cert_key_file(&self) -> Option<&Path> {
         self.bind_cert_key_file.as_deref()
     }
     /// bind_cert_key_pass
+    #[inline]
     pub fn bind_cert_key_pass(&self) -> Option<&str> {
         self.bind_cert_key_pass.as_deref()
     }
@@ -1272,7 +1284,7 @@ impl FromStr for ConfigItem<DomainId, DomainRule> {
                     "-a" | "-address" => {
                         address = parts
                             .next()
-                            .map(IpAddr::from_str)
+                            .map(DomainAddress::from_str)
                             .map(|r| r.ok())
                             .unwrap_or_default()
                     }
@@ -1291,10 +1303,7 @@ impl FromStr for ConfigItem<DomainId, DomainRule> {
                 name: domain,
                 value: DomainRule {
                     speed_check_mode: speed_check_mode.into(),
-                    address: address.map(|addr| match addr {
-                        IpAddr::V4(ip) => DomainAddress::IPv4(ip),
-                        IpAddr::V6(ip) => DomainAddress::IPv6(ip),
-                    }),
+                    address,
                     cname,
                     response_mode: None,
                     nameserver,
@@ -1458,7 +1467,7 @@ mod parse {
     use std::{collections::hash_map::Entry, ffi::OsStr, net::AddrParseError};
 
     impl SmartDnsConfig {
-        pub(super) fn finalize(mut self) -> Arc<Self> {
+        pub fn finalize(mut self) -> Arc<Self> {
             if self.binds.is_empty()
                 && self.binds_tcp.is_empty()
                 && self.binds_https.is_empty()
@@ -1563,10 +1572,51 @@ mod parse {
             self.domain_rule_map = domain_rule_map;
 
             // dedup bind address
-            self.binds.dedup_by(|a, b| a.sock_addr == b.sock_addr);
-            self.binds_tcp.dedup_by(|a, b| a.sock_addr == b.sock_addr);
-            self.binds_https.dedup_by(|a, b| a.sock_addr == b.sock_addr);
-            self.binds_tls.dedup_by(|a, b| a.sock_addr == b.sock_addr);
+            {
+                // priority: QUIC => UDP
+                let mut udp_addr = HashSet::new();
+                // priority: Https => TLS => TCP
+                let mut tcp_addr = HashSet::new();
+
+                fn dedup(addr_set: &mut HashSet<SocketAddr>, binds: &[BindServer]) -> Vec<usize> {
+                    let mut remove_idx = vec![];
+                    for (idx, bind) in binds.iter().enumerate().rev() {
+                        if !addr_set.insert(bind.sock_addr) {
+                            remove_idx.push(idx);
+                        }
+                    }
+                    remove_idx
+                }
+
+                // quic udp
+                for idx in dedup(&mut udp_addr, &self.binds_quic) {
+                    let bind = self.binds_quic.remove(idx);
+                    warn!("remove duplicated bind-quic {:?}", bind.sock_addr);
+                }
+
+                // udp
+                for idx in dedup(&mut udp_addr, &self.binds) {
+                    let bind = self.binds.remove(idx);
+                    warn!("remove duplicated bind-udp {:?}", bind.sock_addr);
+                }
+
+                // https tcp
+                for idx in dedup(&mut tcp_addr, &self.binds_https) {
+                    let bind = self.binds_https.remove(idx);
+                    warn!("remove duplicated bind-https {:?}", bind.sock_addr);
+                }
+                // tls tcp
+                for idx in dedup(&mut tcp_addr, &self.binds_tls) {
+                    let bind = self.binds_tls.remove(idx);
+                    warn!("remove duplicated bind-tls {:?}", bind.sock_addr);
+                }
+
+                // tcp
+                for idx in dedup(&mut tcp_addr, &self.binds_tcp) {
+                    let bind = self.binds_tcp.remove(idx);
+                    warn!("remove duplicated bind-tcp {:?}", bind.sock_addr);
+                }
+            }
 
             self.into()
         }
@@ -1618,6 +1668,7 @@ mod parse {
 
                     match conf_name {
                         "server-name" => self.server_name = options.parse().ok(),
+                        "num-workers" => self.num_workers = options.parse().ok(),
                         "resolv-hostname" => self.resolv_hostname = Some(parse_bool(options)),
                         "user" => self.user = Some(options.to_string()),
                         "domain" => self.domain = options.parse().ok(),
@@ -1992,7 +2043,10 @@ mod parse {
                 if sharp_idx > 1
                     && matches!(line.chars().nth(sharp_idx - 1), Some(c) if c.is_whitespace()) =>
             {
-                line = &line[0..sharp_idx];
+                let preserve = line[0..sharp_idx].trim_end();
+                if !preserve.ends_with("-a") && !preserve.ends_with("-address") {
+                    line = preserve;
+                }
             }
             _ => (),
         };
@@ -2031,16 +2085,13 @@ mod parse {
         fn test_config_binds_dedup() {
             let cfg = SmartDnsConfig::new()
                 .with("bind-tcp 0.0.0.0:4453@eth1")
-                .with("bind-tcp 0.0.0.0:4453@eth1")
+                .with("bind-tls 0.0.0.0:4452@eth1")
+                .with("bind-https 0.0.0.0:4453@eth1")
                 .finalize();
 
-            assert_eq!(cfg.binds_tcp.len(), 1);
-
-            let bind = cfg.binds_tcp.get(0).unwrap();
-
-            assert_eq!(bind.sock_addr, "0.0.0.0:4453".parse().unwrap());
-
-            assert_eq!(bind.device, Some("eth1".to_string()));
+            assert_eq!(cfg.binds_tcp.len(), 0);
+            assert_eq!(cfg.binds_tls.len(), 1);
+            assert_eq!(cfg.binds_https.len(), 1);
         }
 
         #[test]
