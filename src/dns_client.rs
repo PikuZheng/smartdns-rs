@@ -1,17 +1,19 @@
 use std::{
     collections::{HashMap, HashSet},
-    ops::{Deref, DerefMut},
+    ops::Deref,
     path::PathBuf,
     slice::Iter,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use rustls::ClientConfig;
 use tokio::sync::RwLock;
+use trust_dns_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
 
 use crate::{
+    dns_url::DnsUrlParamExt,
     proxy::ProxyConfig,
+    rustls::TlsClientConfigBundle,
     trust_dns::proto::{
         error::ProtoResult,
         op::{Edns, Message, MessageType, OpCode, Query},
@@ -89,7 +91,7 @@ impl DnsClientBuilder {
             proxies,
         } = self;
 
-        let tls_client_config = Self::create_tls_client_config_pair(ca_path, ca_file);
+        let tls_client_config = TlsClientConfigBundle::new(ca_path, ca_file);
 
         bootstrap::set_resolver(
             async {
@@ -194,7 +196,7 @@ impl DnsClientBuilder {
 
     async fn create_name_server_group(
         infos: &[NameServerInfo],
-        tls_client_config: (Arc<ClientConfig>, Arc<ClientConfig>),
+        tls_client_config: TlsClientConfigBundle,
         proxies: &HashMap<String, ProxyConfig>,
     ) -> NameServerGroup {
         let mut servers = vec![];
@@ -203,7 +205,7 @@ impl DnsClientBuilder {
 
         for info in infos {
             let url = info.url.clone();
-            let mut verified_url = match TryInto::<VerifiedDnsUrl>::try_into(url) {
+            let verified_url = match TryInto::<VerifiedDnsUrl>::try_into(url) {
                 Ok(url) => url,
                 Err(mut url) => {
                     if let Some(host) = url.domain() {
@@ -219,15 +221,6 @@ impl DnsClientBuilder {
                     }
                 }
             };
-
-            // tls sni
-            if let Some(n) = info.host_name.as_deref() {
-                if n != "-" {
-                    verified_url.set_host_name(n)
-                } else {
-                    verified_url.set_sni_verify(false)
-                }
-            }
 
             let nameserver_opts = NameServerOpts::new(
                 info.blacklist_ip,
@@ -260,81 +253,6 @@ impl DnsClientBuilder {
             servers,
         }
     }
-
-    fn create_tls_client_config_pair(
-        ca_path: Option<PathBuf>,
-        ca_file: Option<PathBuf>,
-    ) -> (Arc<ClientConfig>, Arc<ClientConfig>) {
-        let config = Self::create_tls_client_config(
-            [ca_path, ca_file]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .as_slice(),
-        );
-
-        let mut config_sni_disable = config.clone();
-        config_sni_disable.enable_sni = false;
-
-        (Arc::new(config), Arc::new(config_sni_disable))
-    }
-
-    fn create_tls_client_config(paths: &[PathBuf]) -> ClientConfig {
-        use rustls::{OwnedTrustAnchor, RootCertStore};
-
-        const ALPN_H2: &[u8] = b"h2";
-
-        let mut root_store = RootCertStore::empty();
-        root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-            OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject,
-                ta.spki,
-                ta.name_constraints,
-            )
-        }));
-
-        let certs = {
-            let certs1 = rustls_native_certs::load_native_certs().unwrap_or_else(|err| {
-                warn!("load native certs failed.{}", err);
-                Default::default()
-            });
-
-            let certs2 = paths
-                .iter()
-                .filter_map(|path| {
-                    match rustls_native_certs::load_certs_from_path(path.as_path()) {
-                        Ok(certs) => Some(certs),
-                        Err(err) => {
-                            warn!("load certs from path failed.{}", err);
-                            None
-                        }
-                    }
-                })
-                .flatten();
-
-            certs1.into_iter().chain(certs2)
-        };
-
-        for cert in certs {
-            root_store
-                .add(&rustls::Certificate(cert.0))
-                .unwrap_or_else(|err| {
-                    warn!("load certs from path failed.{}", err);
-                })
-        }
-
-        let mut client_config = ClientConfig::builder()
-            .with_safe_default_cipher_suites()
-            .with_safe_default_kx_groups()
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        client_config.alpn_protocols.push(ALPN_H2.to_vec());
-
-        client_config
-    }
 }
 
 pub struct DnsClient {
@@ -342,7 +260,7 @@ pub struct DnsClient {
     #[allow(clippy::type_complexity)]
     servers:
         HashMap<NameServerGroupName, (Vec<NameServerInfo>, RwLock<Option<Arc<NameServerGroup>>>)>,
-    tls_client_config: (Arc<ClientConfig>, Arc<ClientConfig>),
+    tls_client_config: TlsClientConfigBundle,
     proxies: Arc<HashMap<String, ProxyConfig>>,
 }
 
@@ -404,9 +322,13 @@ impl GenericResolver for DnsClient {
     }
 
     #[inline]
-    async fn lookup(&self, name: Name, record_type: RecordType) -> Result<Lookup, LookupError> {
+    async fn lookup<N: IntoName + Send, O: Into<LookupOptions> + Send + Clone>(
+        &self,
+        name: N,
+        options: O,
+    ) -> Result<Lookup, LookupError> {
         let ns = self.default().await;
-        GenericResolver::lookup(ns.as_ref(), name, record_type).await
+        GenericResolver::lookup(ns.as_ref(), name, options).await
     }
 }
 
@@ -523,12 +445,17 @@ impl GenericResolver for NameServerGroup {
         &self.resolver_opts
     }
 
-    async fn lookup(&self, name: Name, record_type: RecordType) -> Result<Lookup, LookupError> {
+    async fn lookup<N: IntoName + Send, O: Into<LookupOptions> + Send + Clone>(
+        &self,
+        name: N,
+        options: O,
+    ) -> Result<Lookup, LookupError> {
         use futures_util::future::select_all;
+        let name = name.into_name()?;
         let mut tasks = self
             .servers
             .iter()
-            .map(|ns| GenericResolver::lookup(ns, name.clone(), record_type))
+            .map(|ns| GenericResolver::lookup(ns, name.clone(), options.clone()))
             .collect::<Vec<_>>();
 
         loop {
@@ -571,10 +498,7 @@ impl NameServer {
 
     fn create_config_from_url(
         url: &VerifiedDnsUrl,
-        (tls_client_config_sni_on, tls_client_config_sni_off): (
-            Arc<ClientConfig>,
-            Arc<ClientConfig>,
-        ),
+        tls_client_config: TlsClientConfigBundle,
     ) -> Vec<NameServerConfig> {
         let host = url.domain();
 
@@ -584,6 +508,22 @@ impl NameServer {
 
         use trust_dns_resolver::config::Protocol::*;
         let sock_addrs = url.addrs().iter().cloned();
+
+        let tls_config = |url: &VerifiedDnsUrl| {
+            if url.proto().is_encrypted() {
+                let config = if !url.ssl_verify() {
+                    tls_client_config.verify_off.clone()
+                } else if url.sni_off() {
+                    tls_client_config.sni_off.clone()
+                } else {
+                    tls_client_config.normal.clone()
+                };
+
+                Some(TlsClientConfig(config))
+            } else {
+                None
+            }
+        };
 
         let cfgs = match url.proto() {
             Udp => sock_addrs
@@ -613,11 +553,17 @@ impl NameServer {
                     tls_dns_name: Some(tls_dns_name.clone()),
                     trust_negative_responses: true,
                     bind_addr: None,
-                    tls_config: Some(TlsClientConfig(if url.enable_sni() {
-                        tls_client_config_sni_on.clone()
-                    } else {
-                        tls_client_config_sni_off.clone()
-                    })),
+                    tls_config: tls_config(url),
+                })
+                .collect::<Vec<_>>(),
+            Quic => sock_addrs
+                .map(|addr| NameServerConfig {
+                    socket_addr: addr,
+                    protocol: Protocol::Quic,
+                    tls_dns_name: Some(tls_dns_name.clone()),
+                    trust_negative_responses: true,
+                    bind_addr: None,
+                    tls_config: tls_config(url),
                 })
                 .collect::<Vec<_>>(),
             Protocol::Tls => sock_addrs
@@ -627,11 +573,7 @@ impl NameServer {
                     tls_dns_name: Some(tls_dns_name.clone()),
                     trust_negative_responses: true,
                     bind_addr: None,
-                    tls_config: Some(TlsClientConfig(if url.enable_sni() {
-                        tls_client_config_sni_on.clone()
-                    } else {
-                        tls_client_config_sni_off.clone()
-                    })),
+                    tls_config: tls_config(url),
                 })
                 .collect::<Vec<_>>(),
             _ => todo!(),
@@ -646,7 +588,14 @@ impl GenericResolver for NameServer {
         &self.opts
     }
 
-    async fn lookup(&self, name: Name, record_type: RecordType) -> Result<Lookup, LookupError> {
+    async fn lookup<N: IntoName + Send, O: Into<LookupOptions> + Send + Clone>(
+        &self,
+        name: N,
+        options: O,
+    ) -> Result<Lookup, LookupError> {
+        let name = name.into_name()?;
+        let options: LookupOptions = options.into();
+
         let request_options = {
             let opts = &self.options();
             let mut request_opts = DnsRequestOptions::default();
@@ -655,9 +604,12 @@ impl GenericResolver for NameServer {
             request_opts
         };
 
-        let query = Query::query(name, record_type);
+        let query = Query::query(name, options.record_type);
 
-        let req = DnsRequest::new(build_message(query, request_options), request_options);
+        let req = DnsRequest::new(
+            build_message(query, request_options, options.client_subnet),
+            request_options,
+        );
 
         let mut ns = self.inner.clone();
 
@@ -738,7 +690,11 @@ pub trait GenericResolver {
     /// # Returns
     ///
     ///  A future for the returned Lookup RData
-    async fn lookup(&self, name: Name, record_type: RecordType) -> Result<Lookup, LookupError>;
+    async fn lookup<N: IntoName + Send, O: Into<LookupOptions> + Send + Clone>(
+        &self,
+        name: N,
+        options: O,
+    ) -> Result<Lookup, LookupError>;
 }
 
 #[async_trait::async_trait]
@@ -857,12 +813,6 @@ impl Deref for VerifiedDnsUrl {
     }
 }
 
-impl DerefMut for VerifiedDnsUrl {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
 impl std::convert::TryFrom<DnsUrl> for VerifiedDnsUrl {
     type Error = DnsUrl;
 
@@ -874,11 +824,39 @@ impl std::convert::TryFrom<DnsUrl> for VerifiedDnsUrl {
     }
 }
 
+#[derive(Clone)]
+pub struct LookupOptions {
+    pub record_type: RecordType,
+    pub client_subnet: Option<ClientSubnet>,
+}
+
+impl Default for LookupOptions {
+    fn default() -> Self {
+        Self {
+            record_type: RecordType::A,
+            client_subnet: Default::default(),
+        }
+    }
+}
+
+impl From<RecordType> for LookupOptions {
+    fn from(record_type: RecordType) -> Self {
+        Self {
+            record_type,
+            ..Default::default()
+        }
+    }
+}
+
 /// > An EDNS buffer size of 1232 bytes will avoid fragmentation on nearly all current networks.
 /// https://dnsflagday.net/2020/
 const MAX_PAYLOAD_LEN: u16 = 1232;
 
-fn build_message(query: Query, options: DnsRequestOptions) -> Message {
+fn build_message(
+    query: Query,
+    request_options: DnsRequestOptions,
+    client_subnet: Option<ClientSubnet>,
+) -> Message {
     // build the message
     let mut message: Message = Message::new();
     // TODO: This is not the final ID, it's actually set in the poll method of DNS future
@@ -889,25 +867,27 @@ fn build_message(query: Query, options: DnsRequestOptions) -> Message {
         .set_id(id)
         .set_message_type(MessageType::Query)
         .set_op_code(OpCode::Query)
-        .set_recursion_desired(options.recursion_desired);
+        .set_recursion_desired(request_options.recursion_desired);
 
     // Extended dns
-    if options.use_edns {
+    if client_subnet.is_some() || request_options.use_edns {
         message
             .extensions_mut()
             .get_or_insert_with(Edns::new)
             .set_max_payload(MAX_PAYLOAD_LEN)
             .set_version(0);
+
+        if let (Some(client_subnet), Some(edns)) = (client_subnet, message.extensions_mut()) {
+            edns.options_mut().insert(EdnsOption::Subnet(client_subnet));
+        }
     }
     message
 }
 
 mod connection_provider {
-    use fast_socks5::client::Socks5Stream;
     use futures::Future;
     use std::io;
     use std::pin::Pin;
-    use tokio::net::TcpStream as TokioTcpStream;
     use tokio::net::UdpSocket as TokioUdpSocket;
     use trust_dns_proto::iocompat::AsyncIoTokioAsStd;
 
@@ -916,6 +896,7 @@ mod connection_provider {
     use trust_dns_proto::TokioTime;
     use trust_dns_resolver::{name_server::RuntimeProvider, TokioHandle};
 
+    use crate::proxy;
     use crate::proxy::ProxyConfig;
 
     /// The Tokio Runtime for async execution
@@ -938,7 +919,7 @@ mod connection_provider {
         type Handle = TokioHandle;
         type Timer = TokioTime;
         type Udp = TokioUdpSocket;
-        type Tcp = AsyncIoTokioAsStd<TcpStream>;
+        type Tcp = AsyncIoTokioAsStd<proxy::TcpStream>;
 
         fn create_handle(&self) -> Self::Handle {
             self.handle.clone()
@@ -948,46 +929,12 @@ mod connection_provider {
             &self,
             server_addr: SocketAddr,
         ) -> Pin<Box<dyn Send + Future<Output = io::Result<Self::Tcp>>>> {
-            let proxy = self.proxy.clone();
+            let proxy_config = self.proxy.clone();
 
             Box::pin(async move {
-                match proxy {
-                    Some(config) => match config {
-                        ProxyConfig::Socks(socks) => {
-                            let target_addr = server_addr.ip().to_string();
-                            let target_port = server_addr.port();
-
-                            let socks5stream = if socks.username.is_some() {
-                                Socks5Stream::connect_with_password(
-                                    socks.server,
-                                    target_addr,
-                                    target_port,
-                                    socks.username.unwrap(),
-                                    socks.password.unwrap(),
-                                    Default::default(),
-                                )
-                                .await
-                            } else {
-                                Socks5Stream::connect(
-                                    socks.server,
-                                    target_addr,
-                                    target_port,
-                                    Default::default(),
-                                )
-                                .await
-                            };
-
-                            socks5stream
-                                .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
-                                .map(TcpStream::Proxy)
-                                .map(AsyncIoTokioAsStd)
-                        }
-                    },
-                    None => TokioTcpStream::connect(server_addr)
-                        .await
-                        .map(TcpStream::Tokio)
-                        .map(AsyncIoTokioAsStd),
-                }
+                proxy::connect_tcp(server_addr, proxy_config.as_ref())
+                    .await
+                    .map(AsyncIoTokioAsStd)
             })
         }
 
@@ -997,57 +944,6 @@ mod connection_provider {
             _server_addr: SocketAddr,
         ) -> Pin<Box<dyn Send + Future<Output = io::Result<Self::Udp>>>> {
             Box::pin(tokio::net::UdpSocket::bind(local_addr))
-        }
-    }
-
-    pub enum TcpStream {
-        Tokio(TokioTcpStream),
-        Proxy(Socks5Stream<TokioTcpStream>),
-    }
-
-    impl tokio::io::AsyncRead for TcpStream {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<io::Result<()>> {
-            match self.get_mut() {
-                TcpStream::Tokio(s) => Pin::new(s).poll_read(cx, buf),
-                TcpStream::Proxy(s) => Pin::new(s).poll_read(cx, buf),
-            }
-        }
-    }
-
-    impl tokio::io::AsyncWrite for TcpStream {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<Result<usize, io::Error>> {
-            match self.get_mut() {
-                TcpStream::Tokio(s) => Pin::new(s).poll_write(cx, buf),
-                TcpStream::Proxy(s) => Pin::new(s).poll_write(cx, buf),
-            }
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), io::Error>> {
-            match self.get_mut() {
-                TcpStream::Tokio(s) => Pin::new(s).poll_flush(cx),
-                TcpStream::Proxy(s) => Pin::new(s).poll_flush(cx),
-            }
-        }
-
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), io::Error>> {
-            match self.get_mut() {
-                TcpStream::Tokio(s) => Pin::new(s).poll_shutdown(cx),
-                TcpStream::Proxy(s) => Pin::new(s).poll_shutdown(cx),
-            }
         }
     }
 }
@@ -1158,12 +1054,19 @@ mod bootstrap {
         }
 
         #[inline]
-        async fn lookup(&self, name: Name, record_type: RecordType) -> Result<Lookup, LookupError> {
+        async fn lookup<N: IntoName + Send, O: Into<LookupOptions> + Send + Clone>(
+            &self,
+            name: N,
+            options: O,
+        ) -> Result<Lookup, LookupError> {
+            let name = name.into_name()?;
+            let options: LookupOptions = options.into();
+            let record_type = options.record_type;
             if let Some(lookup) = self.local_lookup(name.clone(), record_type).await {
                 return Ok(lookup);
             }
 
-            match GenericResolver::lookup(self.resolver.as_ref(), name.clone(), record_type).await {
+            match GenericResolver::lookup(self.resolver.as_ref(), name.clone(), options).await {
                 Ok(lookup) => {
                     let records = lookup.records().to_vec();
 
@@ -1231,7 +1134,7 @@ mod tests {
             .block_on(async {
                 let client = DnsClient::builder().build().await;
                 let lookup_ip = client
-                    .lookup("dns.alidns.com".parse().unwrap(), RecordType::A)
+                    .lookup("dns.alidns.com", RecordType::A)
                     .await
                     .unwrap();
                 assert!(lookup_ip
@@ -1413,6 +1316,29 @@ mod tests {
         Runtime::new().unwrap().block_on(async {
             let client = DnsClient::builder().add_server(dns_url).build().await;
 
+            assert_google(&client).await;
+            assert_alidns(&client).await;
+        })
+    }
+
+    #[test]
+    fn test_nameserver_adguard_https_resolve() {
+        let dns_url = DnsUrl::from_str("https://dns.adguard-dns.com/dns-query").unwrap();
+
+        Runtime::new().unwrap().block_on(async {
+            let client = DnsClient::builder().add_server(dns_url).build().await;
+            assert_google(&client).await;
+            assert_alidns(&client).await;
+        })
+    }
+
+    #[test]
+    #[ignore = "not available now"]
+    fn test_nameserver_adguard_quic_resolve() {
+        let dns_url = DnsUrl::from_str("quic://dns.adguard-dns.com").unwrap();
+
+        Runtime::new().unwrap().block_on(async {
+            let client = DnsClient::builder().add_server(dns_url).build().await;
             assert_google(&client).await;
             assert_alidns(&client).await;
         })

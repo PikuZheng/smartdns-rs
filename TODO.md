@@ -156,12 +156,16 @@ The functions that have been completed are not guaranteed to be completely probl
 
   Upstream HTTPS DNS server
 
+- [ ] `server-quic`
+
+   Upstream QUIC DNS server
+
 - [x] `proxy-server`
 
   proxy server
 
   - [x] `socks5`
-  - [ ] `http`
+  - [x] `http`
 
 - [x] `speed-check-mode
 
@@ -181,7 +185,7 @@ The functions that have been completed are not guaranteed to be completely probl
 
   dns64 translation
 
-- [ ] `edns-client-subnet`
+- [x] `edns-client-subnet`
 
   DNS ECS
 
