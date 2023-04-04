@@ -2,7 +2,7 @@
 
 use cli::*;
 use dns_conf::BindServer;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     net::{TcpListener, UdpSocket},
     runtime,
@@ -163,6 +163,7 @@ fn run_server(conf: Option<PathBuf>) {
         Some(log::init_global_default(
             cfg.log_file(),
             cfg.log_level(),
+            cfg.log_filter(),
             cfg.log_size(),
             cfg.log_num(),
             cfg.audit_file_mode().into(),
@@ -255,52 +256,29 @@ fn run_server(conf: Option<PathBuf>) {
     let mut server = ServerRegistry::new(middleware);
 
     // load udp the listeners
-    for bind_server in cfg.binds.iter() {
-        let udp_socket = bind_server.sock_addr;
-        debug!("binding UDP to {:?}", udp_socket);
-        let udp_socket = runtime
-            .block_on(UdpSocket::bind(udp_socket))
-            .unwrap_or_else(|_| panic!("could not bind to udp: {}", udp_socket));
-
-        info!(
-            "listening for UDP on {:?}",
-            udp_socket
-                .local_addr()
-                .expect("could not lookup local address")
-        );
-
+    for bind in cfg.binds() {
         let _guard = runtime.enter();
+        let udp_socket = bind_to(udp, bind.sock_addr, bind.device(), "UDP");
 
         server
-            .with_opts(bind_server.opts.clone())
+            .with_opts(bind.opts.clone())
             .register_socket(udp_socket);
     }
 
     // and TCP as necessary
-    for bind_server in cfg.binds_tcp.iter() {
-        let tcp_listener = bind_server.sock_addr;
-        debug!("binding TCP to {:?}", tcp_listener);
-        let tcp_listener = runtime
-            .block_on(TcpListener::bind(tcp_listener))
-            .unwrap_or_else(|_| panic!("could not bind to tcp: {}", tcp_listener));
-
-        info!(
-            "listening for TCP on {:?}",
-            tcp_listener
-                .local_addr()
-                .expect("could not lookup local address")
-        );
-
+    for bind in cfg.binds_tcp() {
         let _guard = runtime.enter();
+        let tcp_listener = bind_to(tcp, bind.sock_addr, bind.device(), "TCP");
+
         server
-            .with_opts(bind_server.opts.clone())
+            .with_opts(bind.opts.clone())
             .register_listener(tcp_listener, Duration::from_secs(tcp_idle_time));
     }
 
     #[cfg(feature = "dns-over-tls")]
     serve_tls(
         &mut server,
-        &cfg.binds_tls,
+        cfg.binds_tls(),
         &runtime,
         tcp_idle_time,
         cfg.bind_cert_file(),
@@ -309,7 +287,7 @@ fn run_server(conf: Option<PathBuf>) {
     #[cfg(feature = "dns-over-https")]
     serve_https(
         &mut server,
-        &cfg.binds_https,
+        cfg.binds_https(),
         &runtime,
         tcp_idle_time,
         cfg.bind_cert_file(),
@@ -318,7 +296,7 @@ fn run_server(conf: Option<PathBuf>) {
     #[cfg(feature = "dns-over-quic")]
     serve_quic(
         &mut server,
-        &cfg.binds_quic,
+        cfg.binds_quic(),
         &runtime,
         tcp_idle_time,
         cfg.bind_cert_file(),
@@ -333,7 +311,10 @@ fn run_server(conf: Option<PathBuf>) {
 
     info!("server starting up");
 
-    runtime.block_on(signal::terminate()).unwrap_or_default();
+    runtime.block_on(async move {
+        let _ = signal::terminate().await;
+        let _ = server.abort().await;
+    });
 
     runtime.shutdown_timeout(Duration::from_secs(5));
 
@@ -349,7 +330,6 @@ fn serve_tls(
     certificate: Option<&std::path::Path>,
     certificate_key: Option<&std::path::Path>,
 ) {
-    use futures::TryFutureExt;
     use trust_dns_proto::rustls::tls_server::{read_cert, read_key};
 
     for bind in binds {
@@ -382,20 +362,10 @@ fn serve_tls(
         let certificate_key =
             read_key(certificate_key).expect("error loading tls certificate_key file");
 
-        let addr = bind.sock_addr;
-        debug!("binding TLS to {:?}", addr);
-        let tls_listener = runtime.block_on(
-            TcpListener::bind(addr).unwrap_or_else(|_| panic!("could not bind to tls: {}", addr)),
-        );
-
-        info!(
-            "listening for TLS on {:?}",
-            tls_listener
-                .local_addr()
-                .expect("could not lookup local address")
-        );
-
         let _guard = runtime.enter();
+
+        let tls_listener = bind_to(tcp, bind.sock_addr, bind.device(), "TLS");
+
         server
             .with_opts(bind.opts.clone())
             .register_tls_listener(
@@ -416,7 +386,6 @@ fn serve_https(
     certificate: Option<&std::path::Path>,
     certificate_key: Option<&std::path::Path>,
 ) {
-    use futures::TryFutureExt;
     use trust_dns_proto::rustls::tls_server::{read_cert, read_key};
 
     for bind in binds {
@@ -449,21 +418,10 @@ fn serve_https(
         let certificate_key =
             read_key(certificate_key).expect("error loading tls certificate_key file");
 
-        let addr = bind.sock_addr;
-
-        debug!("binding HTTPS to {:?}", addr);
-        let https_listener = runtime.block_on(
-            TcpListener::bind(addr).unwrap_or_else(|_| panic!("could not bind to tls: {}", addr)),
-        );
-
-        info!(
-            "listening for HTTPS on {:?}",
-            https_listener
-                .local_addr()
-                .expect("could not lookup local address")
-        );
-
         let _guard = runtime.enter();
+
+        let https_listener = bind_to(tcp, bind.sock_addr, bind.device(), "HTTPS");
+
         server
             .with_opts(bind.opts.clone())
             .register_https_listener(
@@ -485,7 +443,6 @@ fn serve_quic(
     certificate: Option<&std::path::Path>,
     certificate_key: Option<&std::path::Path>,
 ) {
-    use futures::TryFutureExt;
     use trust_dns_proto::rustls::tls_server::{read_cert, read_key};
 
     for bind in binds {
@@ -518,20 +475,9 @@ fn serve_quic(
         let certificate_key =
             read_key(certificate_key).expect("error loading tls certificate_key file");
 
-        let addr = bind.sock_addr;
-        debug!("binding QUIC to {:?}", addr);
-        let quic_listener = runtime.block_on(
-            UdpSocket::bind(addr).unwrap_or_else(|_| panic!("could not bind to tls: {}", addr)),
-        );
-
-        info!(
-            "listening for QUIC on {:?}",
-            quic_listener
-                .local_addr()
-                .expect("could not lookup local address")
-        );
-
         let _guard = runtime.enter();
+        let quic_listener = bind_to(udp, bind.sock_addr, bind.device(), "QUIC");
+
         server
             .with_opts(bind.opts.clone())
             .register_quic_listener(
@@ -542,6 +488,83 @@ fn serve_quic(
             )
             .expect("could not register QUIC listener");
     }
+}
+
+fn bind_to<T>(
+    func: impl Fn(SocketAddr, Option<&str>, &str) -> io::Result<T>,
+    sock_addr: SocketAddr,
+    bind_device: Option<&str>,
+    bind_type: &str,
+) -> T {
+    func(sock_addr, bind_device, bind_type).unwrap_or_else(|err| {
+        panic!("cound not bind to {bind_type}: {sock_addr}, {err}");
+    })
+}
+
+fn tcp(
+    sock_addr: SocketAddr,
+    bind_device: Option<&str>,
+    bind_type: &str,
+) -> io::Result<TcpListener> {
+    let device_note = bind_device
+        .map(|device| format!("@{device}"))
+        .unwrap_or_default();
+
+    debug!("binding {} to {:?}{}", bind_type, sock_addr, device_note);
+    let tcp_listener = std::net::TcpListener::bind(sock_addr)?;
+
+    {
+        let sock_ref = socket2::SockRef::from(&tcp_listener);
+        sock_ref.set_nonblocking(true)?;
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        if let Some(device) = bind_device {
+            sock_ref.bind_device(Some(device.as_bytes()))?;
+        }
+    }
+
+    let tcp_listener = TcpListener::from_std(tcp_listener)?;
+
+    info!(
+        "listening for {} on {:?}{}",
+        bind_type,
+        tcp_listener
+            .local_addr()
+            .expect("could not lookup local address"),
+        device_note
+    );
+
+    Ok(tcp_listener)
+}
+
+fn udp(sock_addr: SocketAddr, bind_device: Option<&str>, bind_type: &str) -> io::Result<UdpSocket> {
+    let device_note = bind_device
+        .map(|device| format!("@{device}"))
+        .unwrap_or_default();
+
+    debug!("binding {} to {:?}{}", bind_type, sock_addr, device_note);
+    let udp_socket = std::net::UdpSocket::bind(sock_addr)?;
+
+    {
+        let sock_ref = socket2::SockRef::from(&udp_socket);
+        sock_ref.set_nonblocking(true)?;
+
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        if let Some(device) = bind_device {
+            sock_ref.bind_device(Some(device.as_bytes()))?;
+        }
+    }
+
+    let udp_socket = UdpSocket::from_std(udp_socket)?;
+
+    info!(
+        "listening for {} on {:?}{}",
+        bind_type,
+        udp_socket
+            .local_addr()
+            .expect("could not lookup local address"),
+        device_note
+    );
+    Ok(udp_socket)
 }
 
 #[inline]
