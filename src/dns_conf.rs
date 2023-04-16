@@ -1066,21 +1066,27 @@ impl FromStr for BindServer {
         while let Some(part) = parts.next() {
             if part.starts_with('-') {
                 match part {
-                    "-group" => group = parts.next().map(|p| p.to_string()),
-                    "-no-rule-addr" => no_rule_addr = Some(true),
-                    "-no-rule-nameserver" => no_rule_nameserver = Some(true),
-                    "-no-rule-ipset" => no_rule_ipset = Some(true),
-                    "-no-speed-check" => no_speed_check = Some(true),
-                    "-no-cache" => no_cache = Some(true),
-                    "-no-rule-soa" => no_rule_soa = Some(true),
-                    "-no-serve-expired" => no_serve_expired = Some(true),
-                    "-no-dualstack-selection" => no_dualstack_selection = Some(true),
-                    "-force-aaaa-soa" => force_aaaa_soa = Some(true),
-                    "-server-name" => server_name = parts.next().map(|p| p.to_string()),
-                    "-ssl-certificate" => {
+                    "-group" | "--group" => group = parts.next().map(|p| p.to_string()),
+                    "-no-rule-addr" | "--no-rule-addr" => no_rule_addr = Some(true),
+                    "-no-rule-nameserver" | "--no-rule-nameserver" => {
+                        no_rule_nameserver = Some(true)
+                    }
+                    "-no-rule-ipset" | "--no-rule-ipset" => no_rule_ipset = Some(true),
+                    "-no-speed-check" | "--no-speed-check" => no_speed_check = Some(true),
+                    "-no-cache" | "--no-cache" => no_cache = Some(true),
+                    "-no-rule-soa" | "--no-rule-soa" => no_rule_soa = Some(true),
+                    "-no-serve-expired" | "--no-serve-expired" => no_serve_expired = Some(true),
+                    "-no-dualstack-selection" | "--no-dualstack-selection" => {
+                        no_dualstack_selection = Some(true)
+                    }
+                    "-force-aaaa-soa" | "--force-aaaa-soa" => force_aaaa_soa = Some(true),
+                    "-server-name" | "--server-name" => {
+                        server_name = parts.next().map(|p| p.to_string())
+                    }
+                    "-ssl-certificate" | "--ssl-certificate" => {
                         ssl_certificate = parts.next().map(|p| Path::new(p).to_path_buf())
                     }
-                    "-ssl-certificate-key" => {
+                    "-ssl-certificate-key" | "--ssl-certificate-key" => {
                         ssl_certificate_key = parts.next().map(|p| Path::new(p).to_path_buf())
                     }
                     opt => warn!("unknown option: {}", opt),
@@ -1367,6 +1373,16 @@ pub struct NameServerInfo {
 
     /// nameserver group for resolving.
     pub resolve_group: Option<String>,
+
+    /// edns client subnet
+    ///
+    /// ```
+    /// example:
+    ///   edns-client-subnet [ip/subnet]
+    ///   edns-client-subnet 192.168.1.1/24
+    ///   edns-client-subnet 8::8/56
+    /// ```
+    pub edns_client_subnet: Option<IpNet>,
 }
 
 impl FromStr for NameServerInfo {
@@ -1383,21 +1399,32 @@ impl FromStr for NameServerInfo {
             let mut check_edns = false;
             let mut proxy = None;
             let mut bootstrap_dns = false;
+            let mut edns_client_subnet = None;
 
             while let Some(part) = parts.next() {
                 if part.is_empty() {
                     continue;
                 }
                 if part.starts_with('-') {
-                    match part {
-                        "-exclude-default-group" => exclude_default_group = true,
-                        "-blacklist-ip" => blacklist_ip = true,
-                        "-whitelist-ip" => whitelist_ip = true,
-                        "-check-edns" => check_edns = true,
-                        "-bootstrap-dns" => bootstrap_dns = true,
-                        "-group" => group = Some(parts.next().expect("group name").to_string()),
-                        "-proxy" => proxy = Some(parts.next().expect("proxy name").to_string()),
-                        "-host-name" | "-host-name:" => {
+                    match part.trim_end_matches(':') {
+                        "-exclude-default-group" | "--exclude-default-group" => {
+                            exclude_default_group = true
+                        }
+                        "-blacklist-ip" | "--blacklist-ip" => blacklist_ip = true,
+                        "-whitelist-ip" | "--whitelist-ip" => whitelist_ip = true,
+                        "-check-edns" | "--check-edns" => check_edns = true,
+                        "-bootstrap-dns" | "--bootstrap-dns" => bootstrap_dns = true,
+                        "-group" | "--group" => {
+                            group = Some(parts.next().expect("group name").to_string())
+                        }
+                        "-proxy" | "--proxy" => {
+                            proxy = Some(parts.next().expect("proxy name").to_string())
+                        }
+                        "-subnet" | "--subnet" => {
+                            edns_client_subnet =
+                                parts.next().expect("edns client subnet").parse().ok()
+                        }
+                        "-host-name" | "--host-name" => {
                             if let Some(host_name) =
                                 Some(parts.next().expect("host name").to_string())
                             {
@@ -1408,7 +1435,7 @@ impl FromStr for NameServerInfo {
                                 }
                             }
                         }
-                        "-no-check-certificate" => {
+                        "-no-check-certificate" | "--no-check-certificate" => {
                             url.set_ssl_verify(false);
                         }
                         _ => warn!("unknown server options {}", part),
@@ -1427,6 +1454,7 @@ impl FromStr for NameServerInfo {
                 check_edns,
                 proxy,
                 resolve_group: None,
+                edns_client_subnet,
             })
         } else {
             Err(())
@@ -1446,6 +1474,7 @@ impl From<DnsUrl> for NameServerInfo {
             check_edns: false,
             proxy: None,
             resolve_group: None,
+            edns_client_subnet: None,
         }
     }
 }
@@ -1516,36 +1545,42 @@ impl FromStr for ConfigItem<DomainId, DomainRule> {
 
             let mut dualstack_ip_selection = None;
 
-            let mut parts = parse::split_options(parts[1], ' ').peekable();
+            if parts.len() > 1 {
+                let mut parts = parse::split_options(parts[1], ' ').peekable();
 
-            while let Some(part) = parts.next() {
-                match part {
-                    "-c" | "-speed-check-mode" => {
-                        while let Some(s) = parts.peek() {
-                            if s.starts_with('-') {
-                                break;
-                            }
+                while let Some(part) = parts.next() {
+                    match part {
+                        "-c" | "-speed-check-mode" | "--speed-check-mode" => {
+                            while let Some(s) = parts.peek() {
+                                if s.starts_with('-') {
+                                    break;
+                                }
 
-                            if let Some(Ok(mode)) = parts.next().map(SpeedCheckMode::from_str) {
-                                speed_check_mode.push(mode);
+                                if let Some(Ok(mode)) = parts.next().map(SpeedCheckMode::from_str) {
+                                    speed_check_mode.push(mode);
+                                }
                             }
                         }
+                        "-a" | "-address" | "--address" => {
+                            address = parts
+                                .next()
+                                .map(DomainAddress::from_str)
+                                .map(|r| r.ok())
+                                .unwrap_or_default()
+                        }
+                        "-n" | "-nameserver" | "--nameserver" => {
+                            nameserver = parts.next().map(|s| s.to_string())
+                        }
+                        "-d" | "-dualstack-ip-selection" | "--dualstack-ip-selection" => {
+                            dualstack_ip_selection = parts.next().map(parse::parse_bool)
+                        }
+                        "-p" | "-ipset" | "--ipset" => warn!("ignore ipset: {:?}", parts.next()),
+                        "-t" | "-nftset" | "--nftset" => warn!("ignore nftset: {:?}", parts.next()),
+                        "-cname" | "--cname" => {
+                            cname = parts.next().map(|s| s.parse().ok()).unwrap_or_default()
+                        }
+                        opt => warn!("unknown option: {}", opt),
                     }
-                    "-a" | "-address" => {
-                        address = parts
-                            .next()
-                            .map(DomainAddress::from_str)
-                            .map(|r| r.ok())
-                            .unwrap_or_default()
-                    }
-                    "-n" | "-nameserver" => nameserver = parts.next().map(|s| s.to_string()),
-                    "-d" | "-dualstack-ip-selection" => {
-                        dualstack_ip_selection = parts.next().map(parse::parse_bool)
-                    }
-                    "-p" | "-ipset" => warn!("ignore ipset: {:?}", parts.next()),
-                    "-t" | "-nftset" => warn!("ignore nftset: {:?}", parts.next()),
-                    "-cname" => cname = parts.next().map(|s| s.parse().ok()).unwrap_or_default(),
-                    opt => warn!("unknown option: {}", opt),
                 }
             }
 
@@ -2016,7 +2051,7 @@ mod parse {
 
             while let Some(part) = parts.next() {
                 match part {
-                    "-n" | "-name" => name = parts.next().map(|s| s.to_string()),
+                    "-n" | "-name" | "--name" => name = parts.next().map(|s| s.to_string()),
                     _ => proxy = ProxyConfig::from_str(part).ok(),
                 }
             }
@@ -2047,8 +2082,8 @@ mod parse {
 
             while let Some(p) = parts.next() {
                 match p {
-                    "-n" | "-name" => set_name = parts.next(),
-                    "-f" | "-file" => set_path = parts.next(),
+                    "-n" | "-name" | "--name" => set_name = parts.next(),
+                    "-f" | "-file" | "--file" => set_path = parts.next(),
                     _ => warn!(">> domain-set: unexpected options {}.", p),
                 }
             }
@@ -2148,7 +2183,10 @@ mod parse {
                     && matches!(line.chars().nth(sharp_idx - 1), Some(c) if c.is_whitespace()) =>
             {
                 let preserve = line[0..sharp_idx].trim_end();
-                if !preserve.ends_with("-a") && !preserve.ends_with("-address") {
+                if !preserve.ends_with("-a")
+                    && !preserve.ends_with("-address")
+                    && !preserve.ends_with("--address")
+                {
                     line = preserve;
                 }
             }
@@ -2315,6 +2353,31 @@ mod parse {
         }
 
         #[test]
+        fn test_config_server_with_client_subnet() {
+            let mut cfg = SmartDnsConfig::builder();
+            assert_eq!(cfg.servers.values().map(|ss| ss.len()).sum::<usize>(), 0);
+
+            cfg.config(
+                "server-https https://223.5.5.5/dns-query  -bootstrap-dns -exclude-default-group -subnet 192.168.0.0/16",
+            );
+
+            let servers = cfg.servers.get("bootstrap-dns").unwrap();
+
+            assert_eq!(servers.len(), 1);
+
+            let server = servers.first().unwrap();
+
+            assert_eq!(server.url.proto(), &Protocol::Https);
+            assert_eq!(server.url.to_string(), "https://223.5.5.5/dns-query");
+            assert_eq!(
+                server.edns_client_subnet,
+                Some("192.168.0.0/16".parse().unwrap())
+            );
+            assert!(server.exclude_default_group);
+            assert!(server.bootstrap_dns);
+        }
+
+        #[test]
         fn test_config_tls_server() {
             let mut cfg = SmartDnsConfig::builder();
             assert_eq!(cfg.servers.values().map(|ss| ss.len()).sum::<usize>(), 0);
@@ -2350,6 +2413,16 @@ mod parse {
             );
 
             assert_eq!(domain_addr_rule.value, DomainAddress::SOA);
+        }
+
+        #[test]
+        fn test_config_domain_rules_without_args() {
+            let mut cfg = SmartDnsConfig::builder();
+            cfg.config(
+                "domain-set -name domain-forwarding-list -file tests/test_confs/block-list.txt",
+            );
+            cfg.config("domain-rules /domain-set:domain-forwarding-list/");
+            assert!(cfg.address_rules.last().is_none());
         }
 
         #[test]
@@ -2482,6 +2555,24 @@ mod parse {
                 DomainId::Domain(Name::from_str("doh.pub").unwrap().into())
             );
             assert_eq!(domain_rule.address, "127.0.0.1".parse().ok());
+            assert_eq!(
+                domain_rule.speed_check_mode,
+                vec![SpeedCheckMode::Ping].into()
+            );
+            assert_eq!(domain_rule.nameserver, Some("test".to_string()));
+            assert_eq!(domain_rule.dualstack_ip_selection, Some(true));
+        }
+
+        #[test]
+        fn test_config_domain_rule_3() {
+            let cfg = SmartDnsConfig::builder()
+                .with("domain-rules /doh.pub/ -c ping -a # -n test -d yes")
+                .build();
+
+            let domain_rule = cfg.find_domain_rule(&"doh.pub".parse().unwrap()).unwrap();
+
+            assert_eq!(domain_rule.name(), &Name::from_str("doh.pub").unwrap());
+            assert_eq!(domain_rule.address, Some(DomainAddress::SOA));
             assert_eq!(
                 domain_rule.speed_check_mode,
                 vec![SpeedCheckMode::Ping].into()
