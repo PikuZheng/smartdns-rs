@@ -117,11 +117,13 @@ bind 127.0.0.1:53
 
 # Configure bootstrap-dns, if not configured, call the system_conf, 
 # it is recommended to configure, so that it will be encrypted.
-server https://223.5.5.5/dns-query  -bootstrap-dns -exclude-default-group
+server https://1.1.1.1/dns-query  -bootstrap-dns -exclude-default-group
+server https://8.8.8.8/dns-query  -bootstrap-dns -exclude-default-group
 
 # Configure default upstream server
-server https://dns.alidns.com/dns-query
-server https://doh.pub/dns-query
+server https://cloudflare-dns/dns-query
+server https://dns.quad9.net/dns-query
+server https://dns.google/dns-query
 
 # Configure the Office(Home) upstream server
 server 192.168.1.1 -exclude-default-group -group office
@@ -150,7 +152,7 @@ cd smartdns-rs
 cargo build --release
 
 # print help
-cargo build --release
+./target/release/smartdns --help
 
 # run
 sudo ./target/release/smartdns run -c ./etc/smartdns/smartdns.conf
@@ -165,7 +167,7 @@ This software wouldn't have been possible without:
 
 ## License
 
-This software contains codes from [](https://github.com/bluejekyll/trust-dns), which is licensed under either of
+This software contains codes from [https://github.com/bluejekyll/trust-dns](https://github.com/bluejekyll/trust-dns), which is licensed under either of
 
 - Apache License, Version 2.0, (LICENSE-APACHE or [http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0))
 - MIT license (LICENSE-MIT or [http://opensource.org/licenses/MIT](http://opensource.org/licenses/MIT))

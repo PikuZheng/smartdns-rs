@@ -109,12 +109,13 @@ mod tests {
     use std::{fmt::Display, io, net::SocketAddr, sync::Arc};
     use trust_dns_proto::rr::IntoName;
     use trust_dns_proto::rr::TryParseIp;
+    use trust_dns_resolver::name_server::GenericConnector;
     use trust_dns_resolver::{name_server::TokioRuntimeProvider, AsyncResolver};
 
     async fn resolve<N: IntoName + Display + TryParseIp + 'static>(
         host: N,
         port: u16,
-        resolver: Arc<AsyncResolver<TokioRuntimeProvider>>,
+        resolver: Arc<AsyncResolver<GenericConnector<TokioRuntimeProvider>>>,
     ) -> io::Result<Vec<SocketAddr>> {
         // Now we use the global resolver to perform a lookup_ip.
         let name = host.to_string();
@@ -141,27 +142,23 @@ mod tests {
     fn test_with_https_pure_ip_address() {
         use crate::trust_dns::resolver::config::ResolverOpts;
         use crate::trust_dns::resolver::config::{NameServerConfigGroup, ResolverConfig};
-        use crate::trust_dns::resolver::name_server::TokioRuntimeProvider;
 
         use crate::trust_dns::resolver::TokioAsyncResolver;
 
-        let resolver = Arc::new(
-            TokioAsyncResolver::new(
-                ResolverConfig::from_parts(
-                    None,
-                    vec![],
-                    NameServerConfigGroup::from_ips_https(
-                        &["223.5.5.5".parse().unwrap()],
-                        443,
-                        "223.5.5.5".to_string(),
-                        true,
-                    ),
+        let resolver = Arc::new(TokioAsyncResolver::new(
+            ResolverConfig::from_parts(
+                None,
+                vec![],
+                NameServerConfigGroup::from_ips_https(
+                    &["223.5.5.5".parse().unwrap()],
+                    443,
+                    "223.5.5.5".to_string(),
+                    true,
                 ),
-                ResolverOpts::default(),
-                TokioRuntimeProvider::new(),
-            )
-            .unwrap(),
-        );
+            ),
+            ResolverOpts::default(),
+            GenericConnector::default(),
+        ));
 
         use std::thread;
 

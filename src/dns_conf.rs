@@ -19,6 +19,7 @@ use crate::infra::file_mode::FileMode;
 use crate::infra::ipset::IpSet;
 use crate::log::{debug, error, info, warn};
 use crate::proxy::ProxyConfig;
+use crate::third_ext::FromStrOrHex;
 
 const DEFAULT_GROUP: &str = "default";
 
@@ -97,7 +98,6 @@ impl SmartDnsConfig {
 
     pub fn builder() -> SmartDnsConfigBuilder {
         SmartDnsConfigBuilder(InnerConfig {
-            servers: HashMap::from([(DEFAULT_GROUP.to_string(), Default::default())]),
             ..Default::default()
         })
     }
@@ -108,37 +108,33 @@ impl SmartDnsConfig {
     pub fn summary(&self) {
         info!(r#"whoami 👉 {}"#, self.server_name());
 
-        for (group, servers) in self.servers.iter() {
-            if group == DEFAULT_GROUP {
+        for server in self.servers.iter() {
+            if !server.exclude_default_group && server.group.is_empty() {
                 continue;
             }
-            for server in servers {
-                let proxy = server
-                    .proxy
-                    .as_deref()
-                    .map(|n| self.proxies().get(n))
-                    .unwrap_or_default();
+            let proxy = server
+                .proxy
+                .as_deref()
+                .map(|n| self.proxies().get(n))
+                .unwrap_or_default();
 
-                info!(
-                    "upstream server: {} [Group: {}] {}",
-                    server.url.to_string(),
-                    group,
-                    match proxy {
-                        Some(s) => format!("over {}", s),
-                        None => "".to_string(),
-                    }
-                );
-            }
+            info!(
+                "upstream server: {} [Group: {:?}] {}",
+                server.url.to_string(),
+                server.group,
+                match proxy {
+                    Some(s) => format!("over {}", s),
+                    None => "".to_string(),
+                }
+            );
         }
 
-        if let Some(ss) = self.servers.get(DEFAULT_GROUP) {
-            for s in ss {
-                info!(
-                    "upstream server: {} [Group: {}]",
-                    s.url.to_string(),
-                    DEFAULT_GROUP
-                );
-            }
+        for server in self.servers.iter().filter(|s| !s.exclude_default_group) {
+            info!(
+                "upstream server: {} [Group: {}]",
+                server.url.to_string(),
+                DEFAULT_GROUP
+            );
         }
     }
 
@@ -461,7 +457,7 @@ impl SmartDnsConfig {
 
     /// remote dns server list
     #[inline]
-    pub fn servers(&self) -> &HashMap<String, Vec<NameServerInfo>> {
+    pub fn servers(&self) -> &[NameServerInfo] {
         &self.servers
     }
 
@@ -504,6 +500,20 @@ impl SmartDnsConfig {
     #[inline]
     pub fn find_domain_rule(&self, domain: &Name) -> Option<Arc<DomainRuleTreeNode>> {
         self.domain_rule_map.find(domain).cloned()
+    }
+
+    fn get_server_group(&self, group: &str) -> Vec<&NameServerInfo> {
+        if group == DEFAULT_GROUP {
+            self.servers()
+                .iter()
+                .filter(|s| s.group.iter().any(|g| g == DEFAULT_GROUP) || !s.exclude_default_group)
+                .collect::<Vec<_>>()
+        } else {
+            self.servers()
+                .iter()
+                .filter(|s| s.group.iter().any(|g| g == group))
+                .collect::<Vec<_>>()
+        }
     }
 }
 
@@ -554,8 +564,8 @@ impl SmartDnsConfigBuilder {
         );
 
         // set nameserver group for bootstraping
-        for server in cfg.servers.values_mut().flatten() {
-            if server.url.addrs().is_empty() {
+        for server in cfg.servers.iter_mut() {
+            if server.url.ip().is_none() {
                 let host = server.url.host().to_string();
                 if let Ok(Some(rule)) =
                     Name::from_str(host.as_str()).map(|domain| domain_rule_map.find(&domain))
@@ -581,47 +591,41 @@ impl SmartDnsConfigBuilder {
             .collect::<Vec<_>>();
 
             if !binds.is_empty() {
-                #[cfg(not(target_os = "android"))]
-                {
-                    use local_ip_address::list_afinet_netifas;
-                    match list_afinet_netifas() {
-                        Ok(network_interfaces) => {
-                            for bind in binds {
-                                let device = bind.device.as_deref().expect("bind device");
+                use local_ip_address::list_afinet_netifas;
+                match list_afinet_netifas() {
+                    Ok(network_interfaces) => {
+                        for bind in binds {
+                            let device = bind.device.as_deref().expect("bind device");
 
-                                let ips = network_interfaces
-                                    .iter()
-                                    .filter(|(dev, _ip)| dev == device)
-                                    .map(|(_, ip)| *ip)
-                                    .collect::<Vec<_>>();
+                            let ips = network_interfaces
+                                .iter()
+                                .filter(|(dev, _ip)| dev == device)
+                                .map(|(_, ip)| *ip)
+                                .collect::<Vec<_>>();
 
-                                if ips.is_empty() {
-                                    warn!("network device {} not found.", device);
+                            if ips.is_empty() {
+                                warn!("network device {} not found.", device);
+                            }
+
+                            let ip = ips.into_iter().find(|ip| {
+                                match bind.sock_addr {
+                                    SocketAddr::V4(_) => ip.is_ipv4(),
+                                    SocketAddr::V6(_) => ip.is_ipv6() && !matches!(ip, IpAddr::V6(ipv6) if (ipv6.segments()[0] & 0xffc0) == 0xfe80),
                                 }
+                            });
 
-                                let ip = ips.into_iter().find(|ip| {
-                                    match bind.sock_addr {
-                                        SocketAddr::V4(_) => ip.is_ipv4(),
-                                        SocketAddr::V6(_) => ip.is_ipv6() && !matches!(ip, IpAddr::V6(ipv6) if (ipv6.segments()[0] & 0xffc0) == 0xfe80),
-                                    }
-                                });
-
-                                match ip {
-                                    Some(ip) => bind.sock_addr.set_ip(ip),
-                                    None => {
-                                        warn!("no ip address on device {}", device)
-                                    }
+                            match ip {
+                                Some(ip) => bind.sock_addr.set_ip(ip),
+                                None => {
+                                    warn!("no ip address on device {}", device)
                                 }
                             }
                         }
-                        Err(err) => {
-                            warn!("bind device failed, {}", err);
-                        }
+                    }
+                    Err(err) => {
+                        warn!("bind device failed, {}", err);
                     }
                 }
-
-                #[cfg(target_os = "android")]
-                warn!("currently, binding device does not support for android.");
             }
         }
 
@@ -932,7 +936,7 @@ pub struct InnerConfig {
     ca_path: Option<PathBuf>,
 
     /// remote dns server list
-    servers: HashMap<String, Vec<NameServerInfo>>,
+    servers: Vec<NameServerInfo>,
 
     /// specific nameserver to domain
     ///
@@ -1351,7 +1355,7 @@ pub struct NameServerInfo {
     pub url: DnsUrl,
 
     /// set server to group, use with nameserver /domain/group.
-    pub group: Option<String>,
+    pub group: Vec<String>,
 
     /// filter result with blacklist ip
     pub blacklist_ip: bool,
@@ -1383,6 +1387,9 @@ pub struct NameServerInfo {
     ///   edns-client-subnet 8::8/56
     /// ```
     pub edns_client_subnet: Option<IpNet>,
+
+    /// The value for the SO_MARK option on socket.
+    pub so_mark: Option<u32>,
 }
 
 impl FromStr for NameServerInfo {
@@ -1393,13 +1400,14 @@ impl FromStr for NameServerInfo {
 
         if let Some(Ok(mut url)) = parts.next().map(DnsUrl::from_str) {
             let mut exclude_default_group = false;
-            let mut group = None;
+            let mut group = vec![];
             let mut blacklist_ip = false;
             let mut whitelist_ip = false;
             let mut check_edns = false;
             let mut proxy = None;
             let mut bootstrap_dns = false;
             let mut edns_client_subnet = None;
+            let mut mark = None;
 
             while let Some(part) = parts.next() {
                 if part.is_empty() {
@@ -1414,8 +1422,11 @@ impl FromStr for NameServerInfo {
                         "-whitelist-ip" | "--whitelist-ip" => whitelist_ip = true,
                         "-check-edns" | "--check-edns" => check_edns = true,
                         "-bootstrap-dns" | "--bootstrap-dns" => bootstrap_dns = true,
+                        "-set-mark" | "--set-mark" => {
+                            mark = u32::from_str_or_hex(parts.next().expect("mark")).ok();
+                        }
                         "-group" | "--group" => {
-                            group = Some(parts.next().expect("group name").to_string())
+                            group.push(parts.next().expect("group name").to_string())
                         }
                         "-proxy" | "--proxy" => {
                             proxy = Some(parts.next().expect("proxy name").to_string())
@@ -1431,7 +1442,7 @@ impl FromStr for NameServerInfo {
                                 if host_name == "-" {
                                     url.set_sni_off(true);
                                 } else {
-                                    url.set_host_name(&host_name);
+                                    url.set_host(&host_name);
                                 }
                             }
                         }
@@ -1453,6 +1464,7 @@ impl FromStr for NameServerInfo {
                 bootstrap_dns,
                 check_edns,
                 proxy,
+                so_mark: mark,
                 resolve_group: None,
                 edns_client_subnet,
             })
@@ -1466,13 +1478,14 @@ impl From<DnsUrl> for NameServerInfo {
     fn from(url: DnsUrl) -> Self {
         Self {
             url,
-            group: None,
+            group: vec![],
             exclude_default_group: false,
             blacklist_ip: false,
             whitelist_ip: false,
             bootstrap_dns: false,
             check_edns: false,
             proxy: None,
+            so_mark: None,
             resolve_group: None,
             edns_client_subnet: None,
         }
@@ -1544,6 +1557,7 @@ impl FromStr for ConfigItem<DomainId, DomainRule> {
             let mut nameserver = None;
 
             let mut dualstack_ip_selection = None;
+            let mut no_cache = None;
 
             if parts.len() > 1 {
                 let mut parts = parse::split_options(parts[1], ' ').peekable();
@@ -1579,6 +1593,9 @@ impl FromStr for ConfigItem<DomainId, DomainRule> {
                         "-cname" | "--cname" => {
                             cname = parts.next().map(|s| s.parse().ok()).unwrap_or_default()
                         }
+                        "-no-cache" | "--no-cache" => {
+                            no_cache = Some(true);
+                        }
                         opt => warn!("unknown option: {}", opt),
                     }
                 }
@@ -1593,7 +1610,7 @@ impl FromStr for ConfigItem<DomainId, DomainRule> {
                     response_mode: None,
                     nameserver,
                     dualstack_ip_selection,
-                    no_cache: None,
+                    no_cache,
                     no_serve_expired: None,
                     rr_ttl: None,
                     rr_ttl_min: None,
@@ -1749,7 +1766,7 @@ mod parse {
     use byte_unit::Byte;
 
     use super::*;
-    use std::{collections::hash_map::Entry, ffi::OsStr, net::AddrParseError};
+    use std::{ffi::OsStr, net::AddrParseError};
 
     impl SmartDnsConfigBuilder {
         pub fn with(mut self, config: &str) -> Self {
@@ -1927,7 +1944,7 @@ mod parse {
                         "domain-set" => self
                             .config_domain_set(options)
                             .expect("load domain-set failed"),
-                        _ => warn!("unkonwn conf: {}", conf_name),
+                        _ => warn!("unknown conf: {}", conf_name),
                     }
                 }
                 _ => (),
@@ -1955,37 +1972,11 @@ mod parse {
 
             let server_options = server_options.as_deref().unwrap_or(options);
 
-            if let Ok(mut server) = NameServerInfo::from_str(server_options) {
-                if !server.exclude_default_group {
-                    self.servers
-                        .get_mut(DEFAULT_GROUP)
-                        .unwrap()
-                        .push(server.clone());
-                }
-
-                if server.group.is_none() && server.bootstrap_dns {
-                    server.group = Some("bootstrap-dns".to_string());
-                }
-
-                if server.group.is_some() {
-                    debug!(
-                        "append server {} to group {}",
-                        server.url.to_string(),
-                        server.group.as_ref().unwrap()
-                    );
-                }
-
-                if let Some(group) = server.group.as_deref() {
-                    match self.servers.entry(group.to_string()) {
-                        Entry::Occupied(g) => g.into_mut(),
-                        Entry::Vacant(g) => g.insert(vec![]),
-                    }
-                    .push(server);
-                } else if server.exclude_default_group {
+            if let Ok(server) = NameServerInfo::from_str(server_options) {
+                if server.group.is_empty() && server.exclude_default_group {
                     warn!("group name required when `-exclude_default_group` enabled");
-                } else if server.bootstrap_dns {
-                    warn!("upstream server {} not added!!!", server.url.to_string());
                 }
+                self.servers.push(server);
             }
         }
 
@@ -2276,7 +2267,7 @@ mod parse {
 
             assert!(!cfg.binds_https.is_empty());
 
-            let bind = cfg.binds_https.iter().next().unwrap();
+            let bind = cfg.binds_https.first().unwrap();
             let ssl_cfg = bind.ssl_config.as_ref().unwrap();
 
             assert_eq!(
@@ -2297,54 +2288,47 @@ mod parse {
 
         #[test]
         fn test_config_server_0() {
-            let mut cfg = SmartDnsConfig::builder();
+            let cfg = SmartDnsConfig::builder().with(
+                "server-https https://223.5.5.5/dns-query -group bootstrap -exclude-default-group",
+            ).build();
 
-            cfg.config(
-                "server-https https://223.5.5.5/dns-query  -group bootstrap -exclude-default-group",
-            );
+            assert_eq!(cfg.get_server_group("bootstrap").len(), 1);
 
-            assert_eq!(cfg.servers.get("bootstrap").unwrap().len(), 1);
-
-            let server = cfg.servers.get("bootstrap").unwrap().first().unwrap();
+            let server_group = cfg.get_server_group("bootstrap");
+            let server = server_group.first().cloned().unwrap();
 
             assert_eq!(server.url.proto(), &Protocol::Https);
             assert_eq!(server.url.to_string(), "https://223.5.5.5/dns-query");
 
-            assert_eq!(server.group, Some("bootstrap".to_string()));
+            assert!(server.group.iter().any(|g| g == "bootstrap"));
             assert!(server.exclude_default_group);
         }
 
         #[test]
         fn test_config_server_1() {
-            let mut cfg = SmartDnsConfig::builder();
-            assert_eq!(cfg.servers.values().map(|ss| ss.len()).sum::<usize>(), 0);
-
-            cfg.config("server-https https://223.5.5.5/dns-query");
+            let cfg = SmartDnsConfig::builder()
+                .with("server-https https://223.5.5.5/dns-query")
+                .build();
 
             assert_eq!(cfg.servers.len(), 1);
 
-            let server = cfg.servers.get(DEFAULT_GROUP).unwrap().first().unwrap();
+            let server_group = cfg.get_server_group(DEFAULT_GROUP);
+
+            let server = server_group.first().cloned().unwrap();
 
             assert_eq!(server.url.proto(), &Protocol::Https);
             assert_eq!(server.url.to_string(), "https://223.5.5.5/dns-query");
-            assert!(server.group.is_none());
+            assert!(server.group.is_empty());
             assert!(!server.exclude_default_group);
         }
 
         #[test]
         fn test_config_server_2() {
-            let mut cfg = SmartDnsConfig::builder();
-            assert_eq!(cfg.servers.values().map(|ss| ss.len()).sum::<usize>(), 0);
-
-            cfg.config(
+            let cfg = SmartDnsConfig::builder().with(
                 "server-https https://223.5.5.5/dns-query  -bootstrap-dns -exclude-default-group",
-            );
+            ).build();
 
-            let servers = cfg.servers.get("bootstrap-dns").unwrap();
-
-            assert_eq!(servers.len(), 1);
-
-            let server = servers.first().unwrap();
+            let server = cfg.servers.iter().find(|s| s.bootstrap_dns).unwrap();
 
             assert_eq!(server.url.proto(), &Protocol::Https);
             assert_eq!(server.url.to_string(), "https://223.5.5.5/dns-query");
@@ -2354,18 +2338,11 @@ mod parse {
 
         #[test]
         fn test_config_server_with_client_subnet() {
-            let mut cfg = SmartDnsConfig::builder();
-            assert_eq!(cfg.servers.values().map(|ss| ss.len()).sum::<usize>(), 0);
-
-            cfg.config(
+            let cfg = SmartDnsConfig::builder().with(
                 "server-https https://223.5.5.5/dns-query  -bootstrap-dns -exclude-default-group -subnet 192.168.0.0/16",
-            );
+            ).build();
 
-            let servers = cfg.servers.get("bootstrap-dns").unwrap();
-
-            assert_eq!(servers.len(), 1);
-
-            let server = servers.first().unwrap();
+            let server = cfg.servers.iter().find(|s| s.bootstrap_dns).unwrap();
 
             assert_eq!(server.url.proto(), &Protocol::Https);
             assert_eq!(server.url.to_string(), "https://223.5.5.5/dns-query");
@@ -2378,24 +2355,39 @@ mod parse {
         }
 
         #[test]
+        fn test_config_server_with_mark_1() {
+            let cfg = SmartDnsConfig::builder()
+                .with("server-https https://223.5.5.5/dns-query -set-mark 255")
+                .build();
+            let server = cfg.servers.first().unwrap();
+            assert_eq!(server.url.proto(), &Protocol::Https);
+            assert_eq!(server.url.to_string(), "https://223.5.5.5/dns-query");
+            assert_eq!(server.so_mark, Some(255));
+        }
+
+        #[test]
+        fn test_config_server_with_mark_2() {
+            let cfg = SmartDnsConfig::builder()
+                .with("server-https https://223.5.5.5/dns-query -set-mark 0xff")
+                .build();
+
+            let server = cfg.servers.first().unwrap();
+
+            assert_eq!(server.url.proto(), &Protocol::Https);
+            assert_eq!(server.url.to_string(), "https://223.5.5.5/dns-query");
+            assert_eq!(server.so_mark, Some(255));
+        }
+
+        #[test]
         fn test_config_tls_server() {
-            let mut cfg = SmartDnsConfig::builder();
-            assert_eq!(cfg.servers.values().map(|ss| ss.len()).sum::<usize>(), 0);
+            let cfg = SmartDnsConfig::builder().with("server-tls 45.90.28.0 -host-name: dns.nextdns.io -tls-host-verify: dns.nextdns.io").build();
 
-            cfg.config(
-                "server-tls 45.90.28.0 -host-name: dns.nextdns.io -tls-host-verify: dns.nextdns.io",
-            );
-
-            let servers = cfg.servers.get(DEFAULT_GROUP).unwrap();
-
-            assert_eq!(servers.len(), 1);
-
-            let server = servers.first().unwrap();
+            let server = cfg.servers.first().unwrap();
 
             assert!(!server.exclude_default_group);
             assert_eq!(server.url.proto(), &Protocol::Tls);
             assert_eq!(server.url.to_string(), "tls://dns.nextdns.io");
-            assert_eq!(server.url.addrs(), &["45.90.28.0:853".parse().unwrap()]);
+            assert_eq!(server.url.ip(), "45.90.28.0".parse::<IpAddr>().ok());
             assert_eq!(server.url.domain(), Some("dns.nextdns.io"));
         }
 
@@ -2515,7 +2507,7 @@ mod parse {
 
             assert_eq!(
                 nameserver_rule.domain,
-                DomainId::from_str("doh.pub").unwrap().into()
+                DomainId::from_str("doh.pub").unwrap()
             );
 
             assert_eq!(nameserver_rule.nameserver, "bootstrap");
@@ -2531,7 +2523,7 @@ mod parse {
 
             assert_eq!(
                 domain_rule.name,
-                DomainId::Domain(Name::from_str("doh.pub").unwrap().into())
+                DomainId::Domain(Name::from_str("doh.pub").unwrap())
             );
             assert_eq!(domain_rule.address, "127.0.0.1".parse().ok());
             assert_eq!(
@@ -2552,7 +2544,7 @@ mod parse {
 
             assert_eq!(
                 domain_rule.name,
-                DomainId::Domain(Name::from_str("doh.pub").unwrap().into())
+                DomainId::Domain(Name::from_str("doh.pub").unwrap())
             );
             assert_eq!(domain_rule.address, "127.0.0.1".parse().ok());
             assert_eq!(
@@ -2645,7 +2637,7 @@ mod parse {
             assert_eq!(cfg.server_name, "SmartDNS123".parse().ok());
             assert_eq!(
                 cfg.forward_rules.first().unwrap().domain,
-                DomainId::from_str("doh.pub").unwrap().into()
+                DomainId::from_str("doh.pub").unwrap()
             );
             assert_eq!(cfg.forward_rules.first().unwrap().nameserver, "bootstrap");
         }

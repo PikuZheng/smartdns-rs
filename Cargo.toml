@@ -1,6 +1,6 @@
 [package]
 name = "smartdns"
-version = "0.6.0"
+version = "0.6.4"
 authors = ["YISH <mokeyish@hotmail.com>"]
 edition = "2021"
 rust-version = "1.68.0"
@@ -40,11 +40,11 @@ dns-over-https-rustls = [
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [patch.crates-io]
-rustls = { git = "https://github.com/mokeyish/rustls.git", branch = "patched_main"}
-quinn-proto = { git = "https://github.com/mokeyish/quinn.git", branch = "patched_main"}
-trust-dns-proto = { git = "https://github.com/mokeyish/trust-dns.git", rev = "1044ac9"}
-trust-dns-resolver = { git = "https://github.com/mokeyish/trust-dns.git", rev = "1044ac9"}
-trust-dns-server = { git = "https://github.com/mokeyish/trust-dns.git", rev = "1044ac9"}
+# rustls = { git = "https://github.com/mokeyish/rustls.git", branch = "patched_main"}
+# quinn-proto = { git = "https://github.com/mokeyish/quinn.git", branch = "patched_main"}
+# trust-dns-proto = { git = "https://github.com/bluejekyll/trust-dns.git", rev = "41b6e33"}
+# trust-dns-resolver = { git = "https://github.com/bluejekyll/trust-dns.git", rev = "41b6e33"}
+# trust-dns-server = { git = "https://github.com/bluejekyll/trust-dns.git", rev = "41b6e33"}
 # rustls-native-certs = { git = "https://github.com/mokeyish/rustls-native-certs.git" }
 surge-ping = { git = "https://github.com/mokeyish/surge-ping.git", rev = "04c51d6" }
 hostname = { git = "https://github.com/mokeyish/hostname.git", branch = "dev" }
@@ -60,8 +60,8 @@ futures = { version = "0.3.5", default-features = false, features = ["std"] }
 futures-intrusive = "0.5"
 futures-util = { version = "0.3", default-features = false, features = ["std"]}
 async-trait = "0.1.43"
-tokio = { version = "1.21", features = ["time", "rt", "signal", "macros", "parking_lot"] }
-tokio-rustls = "0.23.4"
+tokio = { version = "1.28", features = ["time", "rt", "signal", "macros", "parking_lot"] }
+tokio-rustls = "0.24.0"
 socket2 = { version = "0.5", features = ["all"]}
 
 # log
@@ -74,17 +74,17 @@ tracing-subscriber = { version = "0.3", features = [
 # tracing-appender = "0.2"
 
 # trustdns
-trust-dns-proto = { version = "0.22.0"}
-trust-dns-resolver = { version = "0.22.0", features = ["serde-config", "system-config"]}
-trust-dns-server = { version = "0.22.0", features = ["resolver"]}
+trust-dns-proto = { version = "0.23"}
+trust-dns-resolver = { version = "0.23", features = ["serde-config", "system-config"]}
+trust-dns-server = { version = "0.23", features = ["resolver"]}
 
 # ssl
-webpki-roots = "0.22.1"
-rustls = { version = "0.20.0", features = ["dangerous_configuration"]}
+webpki-roots = "0.25.2"
+rustls = { version = "0.21.1", features = ["dangerous_configuration"]}
 rustls-pemfile = "1.0.2"
 rustls-native-certs = "0.6.2"
 
-lru = { version = "0.10", default-features = false}
+lru = { version = "0.11", default-features = false}
 time = "0.3"
 chrono = "0.4"
 surge-ping = "0.7.4"
@@ -97,18 +97,18 @@ ipnet = "2.7"
 which = "4.3.0"
 
 # process
-sysinfo = "0.27"
+sysinfo = "0.29"
 
 # proxy
 fast-socks5 = "0.8.1"
 async-http-proxy = { version = "1.2.5", features = ["runtime-tokio", "basic-auth"]}
+
+num-traits = "0.2.15"
 url = "2.3.1"
 # regex = "1"
 # rnp = "0.1"
 # boomphf = "0.5.9"
-
-[target.'cfg(not(any(target_os = "android")))'.dependencies]
-local-ip-address = "=0.5.1"
+local-ip-address = "0.5.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 users = { version = "0.11", default-features = false }
@@ -116,11 +116,11 @@ caps = "0.5.5"
 
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.43.0", features = [
+windows = { version = "0.51", features = [
   "Win32_System_Console",
   "Win32_Foundation",
 ] }
-windows-service = "0.5.0"
+windows-service = "0.6.0"
 
 
 [build-dependencies]

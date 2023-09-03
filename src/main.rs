@@ -517,6 +517,10 @@ fn tcp(
         let sock_ref = socket2::SockRef::from(&tcp_listener);
         sock_ref.set_nonblocking(true)?;
         sock_ref.set_reuse_address(true)?;
+
+        #[cfg(target_os = "macos")]
+        sock_ref.set_reuse_port(true)?;
+
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         if let Some(device) = bind_device {
             sock_ref.bind_device(Some(device.as_bytes()))?;
@@ -550,6 +554,9 @@ fn udp(sock_addr: SocketAddr, bind_device: Option<&str>, bind_type: &str) -> io:
         sock_ref.set_nonblocking(true)?;
         sock_ref.set_reuse_address(true)?;
 
+        #[cfg(target_os = "macos")]
+        sock_ref.set_reuse_port(true)?;
+
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         if let Some(device) = bind_device {
             sock_ref.bind_device(Some(device.as_bytes()))?;
@@ -576,13 +583,13 @@ fn hello_starting() {
 
 impl SmartDnsConfig {
     pub async fn create_dns_client(&self) -> DnsClient {
-        let servers = self.servers().clone();
+        let servers = self.servers();
         let ca_path = self.ca_path();
         let ca_file = self.ca_file();
         let proxies = self.proxies().clone();
 
         let mut builder = DnsClient::builder();
-        builder = builder.add_servers(servers.values().flat_map(|s| s.clone()).collect::<Vec<_>>());
+        builder = builder.add_servers(servers.to_vec());
         if let Some(path) = ca_path {
             builder = builder.with_ca_path(path.to_owned());
         }
