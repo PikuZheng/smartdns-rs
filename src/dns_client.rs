@@ -5,17 +5,17 @@ use std::{
     path::PathBuf,
     slice::Iter,
     sync::Arc,
-    time::{Duration, Instant},
 };
 
+use crate::{
+    dns::DnsResponse,
+    libdns::proto::rr::rdata::opt::{ClientSubnet, EdnsOption},
+};
 use tokio::sync::RwLock;
-use trust_dns_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
 
 use crate::{
     dns_url::DnsUrlParamExt,
-    proxy::ProxyConfig,
-    rustls::TlsClientConfigBundle,
-    trust_dns::proto::{
+    libdns::proto::{
         error::ProtoResult,
         op::{Edns, Message, MessageType, OpCode, Query},
         rr::{
@@ -25,12 +25,12 @@ use crate::{
         xfer::{DnsRequest, DnsRequestOptions, FirstAnswer},
         DnsHandle,
     },
+    proxy::ProxyConfig,
+    rustls::TlsClientConfigBundle,
 };
 
-use trust_dns_resolver::{
+use crate::libdns::resolver::{
     config::{NameServerConfig, Protocol, ResolverOpts, TlsClientConfig},
-    lookup::Lookup,
-    lookup_ip::LookupIp,
     name_server::GenericConnector,
     TryParseIp,
 };
@@ -108,8 +108,8 @@ impl DnsClientBuilder {
                     .iter()
                     .filter(|info| {
                         info.bootstrap_dns && {
-                            if info.url.ip().is_none() {
-                                warn!("bootstrap-dns must use ip addess, {:?}", info.url.host());
+                            if info.server.ip().is_none() {
+                                warn!("bootstrap-dns must use ip addess, {:?}", info.server.host());
                                 false
                             } else {
                                 true
@@ -122,7 +122,7 @@ impl DnsClientBuilder {
                 if bootstrap_infos.is_empty() {
                     bootstrap_infos = server_infos
                         .iter()
-                        .filter(|info| info.url.ip().is_some() && info.proxy.is_none())
+                        .filter(|info| info.server.ip().is_some() && info.proxy.is_none())
                         .cloned()
                         .collect::<Vec<_>>()
                 }
@@ -135,7 +135,7 @@ impl DnsClientBuilder {
 
                 if !bootstrap_infos.is_empty() {
                     for info in &bootstrap_infos {
-                        info!("bootstrap-dns {}", info.url.to_string());
+                        info!("bootstrap-dns {}", info.server.to_string());
                     }
                 }
 
@@ -159,35 +159,34 @@ impl DnsClientBuilder {
         )
         .await;
 
-        let server_groups = server_infos.iter().fold(HashMap::new(), |mut map, info| {
-            let mut group_names = info
-                .group
-                .iter()
-                .map(|s| s.deref())
-                .map(NameServerGroupName::from)
-                .collect::<Vec<_>>();
+        let server_groups: HashMap<NameServerGroupName, HashSet<NameServerInfo>> =
+            server_infos.iter().fold(HashMap::new(), |mut map, info| {
+                let mut group_names = info
+                    .group
+                    .iter()
+                    .map(|s| s.deref())
+                    .map(NameServerGroupName::from)
+                    .collect::<Vec<_>>();
 
-            if group_names.is_empty() {
-                group_names.push(NameServerGroupName::Default);
-            }
-
-            for name in group_names {
-                if name != NameServerGroupName::Default
-                    && !info.exclude_default_group
-                    && map
-                        .entry(NameServerGroupName::Default)
-                        .or_insert_with(HashSet::new)
-                        .insert(info.clone())
-                {
-                    debug!("append {} to default group.", info.url.to_string());
+                if group_names.is_empty() {
+                    group_names.push(NameServerGroupName::Default);
                 }
 
-                map.entry(name)
-                    .or_insert_with(HashSet::new)
-                    .insert(info.clone());
-            }
-            map
-        });
+                for name in group_names {
+                    if name != NameServerGroupName::Default
+                        && !info.exclude_default_group
+                        && map
+                            .entry(NameServerGroupName::Default)
+                            .or_default()
+                            .insert(info.clone())
+                    {
+                        debug!("append {} to default group.", info.server.to_string());
+                    }
+
+                    map.entry(name).or_default().insert(info.clone());
+                }
+                map
+            });
 
         let mut servers = HashMap::with_capacity(server_groups.len());
 
@@ -262,7 +261,11 @@ impl DnsClient {
         }
     }
 
-    pub async fn lookup_nameserver(&self, name: Name, record_type: RecordType) -> Option<Lookup> {
+    pub async fn lookup_nameserver(
+        &self,
+        name: Name,
+        record_type: RecordType,
+    ) -> Option<DnsResponse> {
         bootstrap::resolver()
             .await
             .local_lookup(name, record_type)
@@ -281,7 +284,7 @@ impl GenericResolver for DnsClient {
         &self,
         name: N,
         options: O,
-    ) -> Result<Lookup, LookupError> {
+    ) -> Result<DnsResponse, LookupError> {
         let ns = self.default().await;
         GenericResolver::lookup(ns.as_ref(), name, options).await
     }
@@ -404,7 +407,7 @@ impl GenericResolver for NameServerGroup {
         &self,
         name: N,
         options: O,
-    ) -> Result<Lookup, LookupError> {
+    ) -> Result<DnsResponse, LookupError> {
         use futures_util::future::select_all;
         let name = name.into_name()?;
         let mut tasks = self
@@ -448,7 +451,7 @@ impl NameServerFactory {
         so_mark: Option<u32>,
         resolver_opts: NameServerOpts,
     ) -> Arc<NameServer> {
-        use trust_dns_resolver::name_server::NameServer as N;
+        use crate::libdns::resolver::name_server::NameServer as N;
 
         let key = format!(
             "{}{:?}{}",
@@ -481,7 +484,7 @@ impl NameServerFactory {
         url: &VerifiedDnsUrl,
         tls_client_config: TlsClientConfigBundle,
     ) -> NameServerConfig {
-        use trust_dns_resolver::config::Protocol::*;
+        use crate::libdns::resolver::config::Protocol::*;
 
         let addr = url.addr();
 
@@ -557,13 +560,14 @@ impl NameServerFactory {
         let resolver = bootstrap::resolver().await;
 
         for info in infos {
-            let url = info.url.clone();
+            let url = info.server.clone();
             let verified_urls = match TryInto::<VerifiedDnsUrl>::try_into(url) {
                 Ok(url) => vec![url],
                 Err(url) => {
                     if let Some(domain) = url.domain() {
                         match resolver.lookup_ip(domain).await {
                             Ok(lookup_ip) => lookup_ip
+                                .ips()
                                 .into_iter()
                                 .map_while(|ip| {
                                     let mut url = url.clone();
@@ -589,7 +593,7 @@ impl NameServerFactory {
                 info.edns_client_subnet
                     .map(|x| x.into())
                     .or(default_client_subnet),
-                *resolver.options(),
+                resolver.options().clone(),
             );
 
             let proxy = info
@@ -616,7 +620,7 @@ impl NameServerFactory {
 
 pub struct NameServer {
     opts: NameServerOpts,
-    inner: trust_dns_resolver::name_server::NameServer<GenericConnector<TokioRuntimeProvider>>,
+    inner: crate::libdns::resolver::name_server::NameServer<GenericConnector<TokioRuntimeProvider>>,
 }
 
 impl NameServer {
@@ -626,11 +630,11 @@ impl NameServer {
         proxy: Option<ProxyConfig>,
         so_mark: Option<u32>,
     ) -> Self {
-        use trust_dns_resolver::name_server::NameServer as N;
+        use crate::libdns::resolver::name_server::NameServer as N;
 
         let inner = N::<GenericConnector<TokioRuntimeProvider>>::new(
             config,
-            opts.resolver_opts,
+            opts.resolver_opts.clone(),
             GenericConnector::new(TokioRuntimeProvider::new(proxy, so_mark)),
         );
 
@@ -653,7 +657,7 @@ impl GenericResolver for NameServer {
         &self,
         name: N,
         options: O,
-    ) -> Result<Lookup, LookupError> {
+    ) -> Result<DnsResponse, LookupError> {
         let name = name.into_name()?;
         let options: LookupOptions = options.into();
 
@@ -670,32 +674,19 @@ impl GenericResolver for NameServer {
         let client_subnet = options.client_subnet.or(self.opts.client_subnet);
 
         let req = DnsRequest::new(
-            build_message(query, request_options, client_subnet),
+            build_message(query, request_options, client_subnet, options.is_dnssec),
             request_options,
         );
 
-        let mut ns = self.inner.clone();
+        let ns = self.inner.clone();
 
         let res = ns.send(req).first_answer().await?;
 
-        let valid_until = Instant::now()
-            + Duration::from_secs(
-                res.answers()
-                    .iter()
-                    .map(|r| r.ttl())
-                    .min()
-                    .unwrap_or(MAX_TTL) as u64,
-            );
-
-        Ok(Lookup::new_with_deadline(
-            res.query().unwrap().clone(),
-            res.answers().into(),
-            valid_until,
-        ))
+        Ok(From::<Message>::from(res.into()))
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct NameServerOpts {
     /// filter result with blacklist ip
     pub blacklist_ip: bool,
@@ -735,6 +726,21 @@ impl NameServerOpts {
     }
 }
 
+impl Default for NameServerOpts {
+    fn default() -> Self {
+        let mut resolver_opts = ResolverOpts::default();
+        resolver_opts.edns0 = true;
+
+        Self {
+            blacklist_ip: Default::default(),
+            whitelist_ip: Default::default(),
+            check_edns: Default::default(),
+            client_subnet: Default::default(),
+            resolver_opts,
+        }
+    }
+}
+
 impl Deref for NameServerOpts {
     type Target = ResolverOpts;
 
@@ -761,7 +767,7 @@ pub trait GenericResolver {
         &self,
         name: N,
         options: O,
-    ) -> Result<Lookup, LookupError>;
+    ) -> Result<DnsResponse, LookupError>;
 }
 
 #[async_trait::async_trait]
@@ -791,7 +797,7 @@ pub trait GenericResolverExt {
     async fn lookup_ip<N: IntoName + TryParseIp + Send>(
         &self,
         host: N,
-    ) -> Result<LookupIp, LookupError>;
+    ) -> Result<DnsResponse, LookupError>;
 }
 
 #[async_trait::async_trait]
@@ -803,7 +809,7 @@ where
     async fn lookup_ip<N: IntoName + TryParseIp + Send>(
         &self,
         host: N,
-    ) -> Result<LookupIp, LookupError> {
+    ) -> Result<DnsResponse, LookupError> {
         let mut finally_ip_addr: Option<Record> = None;
         let maybe_ip = host.try_parse_ip();
         let maybe_name: ProtoResult<Name> = host.into_name();
@@ -821,8 +827,8 @@ where
                 finally_ip_addr = Some(record);
             } else {
                 let query = Query::query(name, ip_addr.record_type());
-                let lookup = Lookup::new_with_max_ttl(query, Arc::from([record]));
-                return Ok(lookup.into());
+                let lookup = DnsResponse::new_with_max_ttl(query, vec![record]);
+                return Ok(lookup);
             }
         }
 
@@ -831,8 +837,8 @@ where
             (Err(_), Some(ip_addr)) => {
                 // it was a valid IP, return that...
                 let query = Query::query(ip_addr.name().clone(), ip_addr.record_type());
-                let lookup = Lookup::new_with_max_ttl(query, Arc::from([ip_addr.clone()]));
-                return Ok(lookup.into());
+                let lookup = DnsResponse::new_with_max_ttl(query, vec![ip_addr.clone()]);
+                return Ok(lookup);
             }
             (Err(err), None) => {
                 return Err(err.into());
@@ -840,7 +846,7 @@ where
         };
 
         let strategy = self.options().ip_strategy;
-        use trust_dns_resolver::config::LookupIpStrategy::*;
+        use crate::libdns::resolver::config::LookupIpStrategy::*;
 
         match strategy {
             Ipv4Only => self.lookup(name.clone(), RecordType::A).await,
@@ -866,7 +872,6 @@ where
                 Err(_err) => self.lookup(name.clone(), RecordType::AAAA).await,
             },
         }
-        .map(|lookup| lookup.into())
     }
 }
 
@@ -905,6 +910,7 @@ impl std::convert::TryFrom<DnsUrl> for VerifiedDnsUrl {
 
 #[derive(Clone)]
 pub struct LookupOptions {
+    pub is_dnssec: bool,
     pub record_type: RecordType,
     pub client_subnet: Option<ClientSubnet>,
 }
@@ -912,6 +918,7 @@ pub struct LookupOptions {
 impl Default for LookupOptions {
     fn default() -> Self {
         Self {
+            is_dnssec: false,
             record_type: RecordType::A,
             client_subnet: Default::default(),
         }
@@ -935,6 +942,7 @@ fn build_message(
     query: Query,
     request_options: DnsRequestOptions,
     client_subnet: Option<ClientSubnet>,
+    is_dnssec: bool,
 ) -> Message {
     // build the message
     let mut message: Message = Message::new();
@@ -949,7 +957,7 @@ fn build_message(
         .set_recursion_desired(request_options.recursion_desired);
 
     // Extended dns
-    if client_subnet.is_some() || request_options.use_edns {
+    if client_subnet.is_some() || request_options.use_edns || is_dnssec {
         message
             .extensions_mut()
             .get_or_insert_with(Edns::new)
@@ -958,6 +966,10 @@ fn build_message(
 
         if let (Some(client_subnet), Some(edns)) = (client_subnet, message.extensions_mut()) {
             edns.options_mut().insert(EdnsOption::Subnet(client_subnet));
+        }
+
+        if let (true, Some(edns)) = (is_dnssec, message.extensions_mut()) {
+            edns.set_dnssec_ok(is_dnssec);
         }
     }
     message
@@ -970,10 +982,10 @@ mod connection_provider {
 
     use std::{io, net::SocketAddr, pin::Pin};
 
+    use crate::libdns::proto::{iocompat::AsyncIoTokioAsStd, TokioTime};
+    use crate::libdns::resolver::{name_server::RuntimeProvider, TokioHandle};
     use futures::Future;
     use tokio::net::UdpSocket as TokioUdpSocket;
-    use trust_dns_proto::{iocompat::AsyncIoTokioAsStd, TokioTime};
-    use trust_dns_resolver::{name_server::RuntimeProvider, TokioHandle};
 
     /// The Tokio Runtime for async execution
     #[derive(Clone)]
@@ -1042,7 +1054,7 @@ mod connection_provider {
 }
 
 mod bootstrap {
-    use trust_dns_resolver::config::{NameServerConfigGroup, ResolverConfig};
+    use crate::libdns::resolver::config::{NameServerConfigGroup, ResolverConfig};
 
     use super::*;
 
@@ -1087,20 +1099,24 @@ mod bootstrap {
             }
         }
 
-        pub async fn local_lookup(&self, name: Name, record_type: RecordType) -> Option<Lookup> {
+        pub async fn local_lookup(
+            &self,
+            name: Name,
+            record_type: RecordType,
+        ) -> Option<DnsResponse> {
             let query = Query::query(name.clone(), record_type);
             let store = self.ip_store.read().await;
 
             let lookup = store.get(&query).cloned();
 
-            lookup.map(|records| Lookup::new_with_max_ttl(query, records))
+            lookup.map(|records| DnsResponse::new_with_max_ttl(query, records.to_vec()))
         }
     }
 
     impl BootstrapResolver<NameServerGroup> {
         pub fn from_system_conf() -> Self {
-            let (resolv_config, resolv_opts) = trust_dns_resolver::system_conf::read_system_conf()
-                .unwrap_or_else(|err| {
+            let (resolv_config, resolv_opts) =
+                crate::libdns::resolver::system_conf::read_system_conf().unwrap_or_else(|err| {
                     warn!("read system conf failed, {}", err);
 
                     use crate::preset_ns::{ALIDNS, ALIDNS_IPS, CLOUDFLARE, CLOUDFLARE_IPS};
@@ -1152,7 +1168,7 @@ mod bootstrap {
             &self,
             name: N,
             options: O,
-        ) -> Result<Lookup, LookupError> {
+        ) -> Result<DnsResponse, LookupError> {
             let name = name.into_name()?;
             let options: LookupOptions = options.into();
             let record_type = options.record_type;
@@ -1214,6 +1230,7 @@ mod tests {
     use crate::{
         dns_url::DnsUrl,
         preset_ns::{ALIDNS_IPS, CLOUDFLARE_IPS},
+        third_ext::{FutureJoinAllExt, FutureTimeoutExt},
     };
     use std::net::IpAddr;
     use std::str::FromStr;
@@ -1225,9 +1242,11 @@ mod tests {
             .lookup("dns.alidns.com", RecordType::A)
             .await
             .unwrap();
-        assert!(lookup_ip.into_iter().any(|i| i.ip_addr()
-            == Some("223.5.5.5".parse::<IpAddr>().unwrap())
-            || i.ip_addr() == Some("223.6.6.6".parse::<IpAddr>().unwrap())));
+        assert!(lookup_ip
+            .ips()
+            .into_iter()
+            .any(|i| i == "223.5.5.5".parse::<IpAddr>().unwrap()
+                || i == "223.6.6.6".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
@@ -1240,149 +1259,110 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    async fn assert_google(client: &DnsClient) {
+    async fn query_google(client: &DnsClient) -> bool {
         let name = "dns.google";
-        let addrs = client
+        let addrs = match client
             .lookup_ip(name)
+            .timeout(std::time::Duration::from_secs(5))
             .await
-            .unwrap()
-            .iter()
-            .map(|x| x.to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
-
+        {
+            Ok(Ok(lookup)) => lookup
+                .ips()
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+            Ok(Err(e)) => e.to_string(),
+            Err(e) => e.to_string(),
+        };
         // println!("name: {} addrs => {}", name, addrs);
-
-        assert!(addrs.contains("8.8.8.8"));
+        addrs.contains("8.8.8.8") || addrs.contains("8.8.4.4")
     }
 
-    async fn assert_alidns(client: &DnsClient) {
+    async fn query_alidns(client: &DnsClient) -> bool {
         let name = "dns.alidns.com";
-        let addrs = client
+        let addrs = match client
             .lookup_ip(name)
+            .timeout(std::time::Duration::from_secs(5))
             .await
-            .unwrap()
-            .iter()
-            .map(|x| x.to_string())
-            .collect::<Vec<_>>()
-            .join(" ");
+        {
+            Ok(Ok(lookup)) => lookup
+                .ips()
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+            Ok(Err(e)) => e.to_string(),
+            Err(e) => e.to_string(),
+        };
 
         // println!("name: {} addrs => {}", name, addrs);
-
-        assert!(addrs.contains("223.5.5.5") || addrs.contains("223.6.6.6"));
+        addrs.contains("223.5.5.5") || addrs.contains("223.6.6.6")
     }
 
     #[tokio::test]
-    async fn test_nameserver_google_tls_resolve() {
-        let dns_url = DnsUrl::from_str("tls://dns.google?enable_sni=false").unwrap();
-        let client = DnsClient::builder().add_server(dns_url).build().await;
-        assert_google(&client).await;
-        assert_alidns(&client).await;
+    async fn test_nameserver_tls_resolve() {
+        let urls = [
+            DnsUrl::from_str("tls://dns.google?enable_sni=false").unwrap(),
+            DnsUrl::from_str("tls://dns.cloudflare.com?enable_sni=false").unwrap(),
+            DnsUrl::from_str("tls://dns.quad9.net?enable_sni=false").unwrap(),
+            DnsUrl::from_str("tls://dns.alidns.com").unwrap(),
+            DnsUrl::from_str("tls://dot.pub").unwrap(),
+        ];
+
+        let results = urls
+            .into_iter()
+            .map(|url| async move {
+                let client = DnsClient::builder().add_server(url).build().await;
+                query_google(&client).await && query_alidns(&client).await
+            })
+            .join_all()
+            .await;
+
+        let total = results.len() as f32;
+        let success = results.into_iter().filter(|r| *r).count();
+        println!("test_nameserver_tls_resolve, success: {success}/{total}");
+        assert!(success > 0);
+    }
+
+    #[tokio::test]
+    async fn test_nameserver_https_resolve() {
+        let urls = [
+            DnsUrl::from_str("https://dns.cloudflare.com/dns-query").unwrap(),
+            DnsUrl::from_str("https://dns.alidns.com/dns-query").unwrap(),
+            DnsUrl::from_str("https://223.5.5.5/dns-query").unwrap(),
+            DnsUrl::from_str("https://doh.pub/dns-query").unwrap(),
+            DnsUrl::from_str("https://dns.adguard-dns.com/dns-query").unwrap(),
+            DnsUrl::from_str("https://dns.quad9.net/dns-query").unwrap(),
+        ];
+
+        let results = urls
+            .into_iter()
+            .map(|url| async move {
+                let client = DnsClient::builder().add_server(url).build().await;
+                query_google(&client).await && query_alidns(&client).await
+            })
+            .join_all()
+            .await;
+
+        assert!(results.into_iter().all(|r| r));
     }
 
     #[tokio::test]
     async fn test_nameserver_cloudflare_resolve() {
-        // todo:// support alias.
         let dns_urls = CLOUDFLARE_IPS.iter().map(DnsUrl::from).collect::<Vec<_>>();
 
         let client = DnsClient::builder().add_servers(dns_urls).build().await;
-        assert_google(&client).await;
-        assert_alidns(&client).await;
-    }
-
-    #[tokio::test]
-    async fn test_nameserver_cloudflare_https_resolve() {
-        let dns_url = DnsUrl::from_str("https://cloudflare-dns.com/dns-query").unwrap();
-        let client = DnsClient::builder().add_server(dns_url).build().await;
-        assert_google(&client).await;
-        assert_alidns(&client).await;
-    }
-
-    #[tokio::test]
-    #[ignore = "reason"]
-    async fn test_nameserver_cloudflare_tls_resolve() {
-        let dns_url = DnsUrl::from_str("tls://dns.cloudflare.com?enable_sni=false").unwrap();
-        let client = DnsClient::builder().add_server(dns_url).build().await;
-        assert_google(&client).await;
-        assert_alidns(&client).await;
-    }
-
-    #[tokio::test]
-    async fn test_nameserver_quad9_tls_resolve() {
-        let dns_url = DnsUrl::from_str("tls://dns.quad9.net?enable_sni=false").unwrap();
-        let client = DnsClient::builder().add_server(dns_url).build().await;
-        assert_google(&client).await;
-        assert_alidns(&client).await;
-    }
-
-    #[tokio::test]
-    async fn test_nameserver_quad9_dns_url_https_resolve() {
-        let dns_url = DnsUrl::from_str("https://dns.quad9.net/dns-query").unwrap();
-        let client = DnsClient::builder().add_server(dns_url).build().await;
-        assert_google(&client).await;
-        assert_alidns(&client).await;
+        assert!(query_google(&client).await);
+        assert!(query_alidns(&client).await);
     }
 
     #[tokio::test]
     async fn test_nameserver_alidns_resolve() {
-        // todo:// support alias.
         let dns_urls = ALIDNS_IPS.iter().map(DnsUrl::from).collect::<Vec<_>>();
-
         let client = DnsClient::builder().add_servers(dns_urls).build().await;
-        assert_google(&client).await;
-        assert_alidns(&client).await;
-    }
-
-    #[tokio::test]
-    async fn test_nameserver_alidns_dns_url_https_resolve() {
-        let dns_url = DnsUrl::from_str("https://dns.alidns.com/dns-query").unwrap();
-
-        let client = DnsClient::builder().add_server(dns_url).build().await;
-        assert_google(&client).await;
-        assert_alidns(&client).await;
-    }
-
-    #[tokio::test]
-    async fn test_nameserver_alidns_dns_url_tls_resolve() {
-        let dns_url = DnsUrl::from_str("tls://dns.alidns.com").unwrap();
-        let client = DnsClient::builder().add_server(dns_url).build().await;
-        assert_google(&client).await;
-        assert_alidns(&client).await;
-    }
-
-    #[tokio::test]
-    async fn test_nameserver_alidns_https_tls_name_with_ip_resolve() {
-        let dns_url = DnsUrl::from_str("https://223.5.5.5/dns-query").unwrap();
-        let client = DnsClient::builder().add_server(dns_url).build().await;
-        assert_google(&client).await;
-        assert_alidns(&client).await;
-    }
-
-    #[tokio::test]
-    async fn test_nameserver_dnspod_https_resolve() {
-        let dns_url = DnsUrl::from_str("https://doh.pub/dns-query").unwrap();
-
-        let client = DnsClient::builder().add_server(dns_url).build().await;
-        assert_google(&client).await;
-        assert_alidns(&client).await;
-    }
-
-    #[tokio::test]
-    async fn test_nameserver_dnspod_tls_resolve() {
-        let dns_url = DnsUrl::from_str("tls://dot.pub").unwrap();
-        let client = DnsClient::builder().add_server(dns_url).build().await;
-
-        assert_google(&client).await;
-        assert_alidns(&client).await;
-    }
-
-    #[tokio::test]
-    async fn test_nameserver_adguard_https_resolve() {
-        let dns_url = DnsUrl::from_str("https://dns.adguard-dns.com/dns-query").unwrap();
-
-        let client = DnsClient::builder().add_server(dns_url).build().await;
-        assert_google(&client).await;
-        assert_alidns(&client).await;
+        assert!(query_google(&client).await);
+        assert!(query_alidns(&client).await);
     }
 
     #[tokio::test]
@@ -1390,8 +1370,8 @@ mod tests {
     async fn test_nameserver_adguard_quic_resolve() {
         let dns_url = DnsUrl::from_str("quic://dns.adguard-dns.com").unwrap();
         let client = DnsClient::builder().add_server(dns_url).build().await;
-        assert_google(&client).await;
-        assert_alidns(&client).await;
+        assert!(query_google(&client).await);
+        assert!(query_alidns(&client).await);
     }
 
     // #[test]

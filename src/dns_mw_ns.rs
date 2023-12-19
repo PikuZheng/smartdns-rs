@@ -4,22 +4,19 @@ use std::sync::Arc;
 use std::{borrow::Borrow, net::IpAddr, pin::Pin, time::Duration};
 
 use crate::dns_client::{LookupOptions, NameServer};
-use crate::dns_conf::SpeedCheckModeList;
+
 use crate::infra::ipset::IpSet;
 use crate::{
+    config::{ResponseMode, SpeedCheckMode, SpeedCheckModeList},
     dns::*,
-    dns_client::GenericResolver,
-    dns_client::{DnsClient, NameServerGroup},
-    dns_conf::SpeedCheckMode,
+    dns_client::{DnsClient, GenericResolver, NameServerGroup},
     dns_error::LookupError,
-    dns_rule::ResponseMode,
     log::{debug, error},
     middleware::*,
 };
 
+use crate::libdns::proto::op::ResponseCode;
 use futures::{Future, FutureExt};
-use trust_dns_proto::op::ResponseCode;
-use trust_dns_resolver::lookup_ip::LookupIp;
 
 pub struct NameServerMiddleware {
     client: DnsClient,
@@ -84,6 +81,7 @@ impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError> for NameServerMid
         }
 
         let lookup_options = LookupOptions {
+            is_dnssec: req.is_dnssec(),
             record_type: rtype,
             client_subnet: None,
         };
@@ -142,10 +140,7 @@ impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError> for NameServerMid
                 opts.response_strategy = ResponseMode::FastestIp;
             }
 
-            match lookup_ip(name_server_group.deref(), name.clone(), &opts).await {
-                Ok(lookup_ip) => Ok(lookup_ip.into()),
-                Err(err) => Err(err),
-            }
+            lookup_ip(name_server_group.deref(), name.clone(), &opts).await
         } else {
             name_server_group.lookup(name.clone(), lookup_options).await
         }
@@ -186,7 +181,7 @@ async fn lookup_ip(
     server: &NameServerGroup,
     name: Name,
     options: &LookupIpOptions,
-) -> Result<LookupIp, LookupError> {
+) -> Result<DnsResponse, LookupError> {
     use crate::third_ext::FutureJoinAllExt;
     use futures_util::future::{select_all, select_ok};
 
@@ -205,20 +200,22 @@ async fn lookup_ip(
     }
 
     let ping_duration = |fut: Pin<
-        Box<dyn Future<Output = Result<LookupIp, LookupError>> + Send>,
+        Box<dyn Future<Output = Result<DnsResponse, LookupError>> + Send>,
     >| async {
         let res = fut.await;
         let res2 = match res {
             Ok(lookup_ip) => {
                 use crate::infra::ping::{ping_fastest, PingAddr, PingOptions};
 
-                let ips = lookup_ip.iter().collect::<Vec<_>>();
+                let ips = lookup_ip.ips();
                 if ips.is_empty() {
                     return Ok((Default::default(), lookup_ip));
                 }
                 let ping_ops = PingOptions::default().with_timeout_secs(2);
 
                 let mut ping_tasks = vec![];
+
+                let name = lookup_ip.query().name();
 
                 for mode in options.speed_check_mode.iter() {
                     let ping_dests = match mode {
@@ -227,34 +224,19 @@ async fn lookup_ip(
                             ips.iter().map(|ip| PingAddr::Icmp(*ip)).collect::<Vec<_>>()
                         }
                         SpeedCheckMode::Tcp(port) => {
-                            debug!(
-                                "Speed test {} tcp ping {:?} port {}",
-                                lookup_ip.query().name(),
-                                ips,
-                                port
-                            );
+                            debug!("Speed test {} tcp ping {:?} port {}", name, ips, port);
                             ips.iter()
                                 .map(|ip| PingAddr::Tcp(SocketAddr::new(*ip, *port)))
                                 .collect::<Vec<_>>()
                         }
                         SpeedCheckMode::Http(port) => {
-                            debug!(
-                                "Speed test {} http ping {:?} port {}",
-                                lookup_ip.query().name(),
-                                ips,
-                                port
-                            );
+                            debug!("Speed test {} http ping {:?} port {}", name, ips, port);
                             ips.iter()
                                 .map(|ip| PingAddr::Http(SocketAddr::new(*ip, *port)))
                                 .collect::<Vec<_>>()
                         }
                         SpeedCheckMode::Https(port) => {
-                            debug!(
-                                "Speed test {} https ping {:?} port {}",
-                                lookup_ip.query().name(),
-                                ips,
-                                port
-                            );
+                            debug!("Speed test {} https ping {:?} port {}", name, ips, port);
                             ips.iter()
                                 .map(|ip| PingAddr::Https(SocketAddr::new(*ip, *port)))
                                 .collect::<Vec<_>>()
@@ -273,7 +255,7 @@ async fn lookup_ip(
                 match ping_res {
                     Ok((out, _)) => {
                         let dura = out.duration();
-                        let lookup = lookup_ip.as_lookup();
+                        let lookup = lookup_ip;
                         let query = lookup.query().clone();
                         let valid_until = lookup.valid_until();
                         let records = lookup
@@ -293,15 +275,13 @@ async fn lookup_ip(
                                 _ => false,
                             })
                             .map(|r| r.to_owned())
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice();
+                            .collect::<Vec<_>>();
                         debug!(
                             "The fastest ip of {} is {}",
                             query.name(),
                             out.destination().ip()
                         );
-                        let lookup_ip: LookupIp =
-                            Lookup::new_with_deadline(query, records.into(), valid_until).into();
+                        let lookup_ip = DnsResponse::new_with_deadline(query, records, valid_until);
                         Ok((dura, lookup_ip))
                     }
                     Err(_) => Ok((Default::default(), lookup_ip)),
@@ -391,12 +371,8 @@ async fn lookup_ip(
         }
         FastestResponse => loop {
             let (res, _idx, rest) = select_all(tasks).await;
-            if res.is_ok() {
-                return res.map(LookupIp::from);
-            }
-
-            if rest.is_empty() {
-                return res.map(LookupIp::from);
+            if res.is_ok() || rest.is_empty() {
+                return res;
             }
             tasks = rest;
         },
@@ -407,7 +383,7 @@ async fn per_nameserver_lookup_ip(
     server: &NameServer,
     name: Name,
     options: &LookupIpOptions,
-) -> Result<LookupIp, LookupError> {
+) -> Result<DnsResponse, LookupError> {
     assert!(matches!(
         options.lookup_options.record_type,
         RecordType::A | RecordType::AAAA
@@ -427,7 +403,7 @@ async fn per_nameserver_lookup_ip(
     } = options;
 
     if !whitelist_on && !blacklist_on && ignore_ip.is_empty() {
-        return res.map(LookupIp::from);
+        return res;
     }
 
     let ip_filter = |ip: &IpAddr| {
@@ -468,7 +444,7 @@ async fn per_nameserver_lookup_ip(
                 .into());
             }
 
-            Ok(Lookup::new_with_max_ttl(query, records.into()).into())
+            Ok(DnsResponse::new_with_max_ttl(query, records))
         }
         Err(err) => Err(err),
     }
@@ -478,10 +454,10 @@ async fn per_nameserver_lookup_ip(
 mod tests {
     use std::str::FromStr;
 
-    use trust_dns_proto::rr::rdata::opt::ClientSubnet;
+    use crate::libdns::proto::rr::rdata::opt::ClientSubnet;
 
     use super::*;
-    use crate::{dns_conf::SmartDnsConfig, third_ext::FutureJoinAllExt};
+    use crate::{dns_conf::RuntimeConfig, third_ext::FutureJoinAllExt};
 
     #[test]
     fn test_edns_client_subnet() {
@@ -495,7 +471,7 @@ mod tests {
 
             let server = servers[i % servers.len()];
 
-            let cfg = SmartDnsConfig::builder().with(server).build();
+            let cfg = RuntimeConfig::builder().with(server).build();
 
             let domain = "www.bing.com";
 
@@ -509,6 +485,7 @@ mod tests {
                     client.lookup(
                         domain,
                         LookupOptions {
+                            is_dnssec: false,
                             record_type: RecordType::A,
                             client_subnet: Some(ClientSubnet::from_str(subnet).unwrap()),
                         },
@@ -519,7 +496,7 @@ mod tests {
                 .into_iter()
                 .flatten()
                 .map(|lookup| {
-                    let mut ips = lookup.iter().flat_map(|r| r.ip_addr()).collect::<Vec<_>>();
+                    let mut ips = lookup.ips();
                     ips.sort();
                     ips
                 })

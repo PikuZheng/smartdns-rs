@@ -1,22 +1,61 @@
 use std::{borrow::Borrow, sync::Arc};
 
-use trust_dns_proto::{
+use crate::libdns::proto::{
     op::{Query, ResponseCode},
     rr::{rdata::SOA, IntoName, Record, RecordType},
 };
 
-use trust_dns_resolver::error::ResolveErrorKind;
+use crate::libdns::resolver::error::ResolveErrorKind;
 
 use crate::{
+    config::ServerOpts,
     dns::{DefaultSOA, DnsContext, DnsError, DnsRequest, DnsResponse},
-    dns_conf::{ServerOpts, SmartDnsConfig},
+    dns_conf::RuntimeConfig,
     middleware::{Middleware, MiddlewareBuilder, MiddlewareDefaultHandler, MiddlewareHost},
 };
 
 pub type DnsMiddlewareHost = MiddlewareHost<DnsContext, DnsRequest, DnsResponse, DnsError>;
 
+pub struct BackgroundQueryTask {
+    pub ctx: DnsContext,
+    pub req: DnsRequest,
+    client: Arc<DnsMiddlewareHost>,
+}
+
+impl BackgroundQueryTask {
+    pub fn new(ctx: &DnsContext, req: &DnsRequest, client: Arc<DnsMiddlewareHost>) -> Self {
+        Self {
+            ctx: ctx.clone(),
+            req: req.clone(),
+            client,
+        }
+    }
+
+    pub fn from_query(
+        query: Query,
+        cfg: Arc<RuntimeConfig>,
+        client: Arc<DnsMiddlewareHost>,
+    ) -> Self {
+        let ctx = DnsContext::new(query.name(), cfg, Default::default());
+        let req = query.into();
+        Self { ctx, req, client }
+    }
+
+    pub fn spawn(self) -> tokio::task::JoinHandle<(Self, Result<DnsResponse, DnsError>)> {
+        tokio::spawn(async move {
+            let Self {
+                mut ctx,
+                req,
+                client,
+            } = self;
+            let res = client.execute(&mut ctx, &req).await;
+            (Self { ctx, req, client }, res)
+        })
+    }
+}
+
 pub struct DnsMiddlewareHandler {
-    cfg: Arc<SmartDnsConfig>,
+    cfg: Arc<RuntimeConfig>,
     host: DnsMiddlewareHost,
 }
 
@@ -60,7 +99,7 @@ impl DnsMiddlewareBuilder {
         self
     }
 
-    pub fn build(self, cfg: Arc<SmartDnsConfig>) -> DnsMiddlewareHandler {
+    pub fn build(self, cfg: Arc<RuntimeConfig>) -> DnsMiddlewareHandler {
         DnsMiddlewareHandler {
             host: self.builder.build(),
             cfg,
@@ -100,13 +139,12 @@ pub use tests::*;
 #[cfg(test)]
 mod tests {
 
+    use crate::libdns::proto::rr::RData;
     use std::{
         collections::HashMap,
         fmt::Debug,
         net::{Ipv4Addr, Ipv6Addr},
     };
-    use trust_dns_proto::rr::RData;
-    use trust_dns_resolver::lookup::Lookup;
 
     use super::*;
     use crate::infra::middleware::*;
@@ -166,7 +204,7 @@ mod tests {
             self
         }
 
-        pub fn build<T: Into<Arc<SmartDnsConfig>>>(self, cfg: T) -> DnsMiddlewareHandler {
+        pub fn build<T: Into<Arc<RuntimeConfig>>>(self, cfg: T) -> DnsMiddlewareHandler {
             let Self { map, builder } = self;
 
             builder.with(DnsMockMiddleware { map }).build(cfg.into())
@@ -206,17 +244,15 @@ mod tests {
             self.with_multi_records(record.name().clone(), vec![record])
         }
 
-        pub fn with_multi_records<Name: IntoName + Debug, Records: Into<Arc<[Record]>>>(
+        pub fn with_multi_records<Name: IntoName + Debug>(
             mut self,
             name: Name,
-            records: Records,
+            records: Vec<Record>,
         ) -> Self {
             let name = match name.into_name() {
                 Ok(name) => name,
                 Err(err) => panic!("invalid Name {}", err),
             };
-
-            let records: Arc<[Record]> = records.into();
 
             let query = Query::query(
                 name,
@@ -226,8 +262,10 @@ mod tests {
                     .record_type(),
             );
 
-            self.map
-                .insert(query.clone(), Ok(Lookup::new_with_max_ttl(query, records)));
+            self.map.insert(
+                query.clone(),
+                Ok(DnsResponse::new_with_max_ttl(query, records)),
+            );
 
             self
         }
@@ -239,9 +277,13 @@ mod tests {
             name: N,
             query_type: RecordType,
         ) -> Result<Vec<RData>, DnsError> {
-            self.lookup(name, query_type)
-                .await
-                .map(|lookup| lookup.into_iter().collect())
+            self.lookup(name, query_type).await.map(|lookup| {
+                lookup
+                    .record_iter()
+                    .flat_map(|s| s.data())
+                    .cloned()
+                    .collect()
+            })
         }
     }
 
@@ -249,7 +291,7 @@ mod tests {
     async fn test_mock_middleware_ip() {
         let mw = DnsMockMiddleware::builder()
             .with_a_record("qq.com", "1.5.6.7".parse().unwrap())
-            .build(SmartDnsConfig::default());
+            .build(RuntimeConfig::default());
 
         let res = mw.lookup_rdata("qq.com", RecordType::A).await.unwrap();
 
@@ -260,7 +302,7 @@ mod tests {
     async fn test_mock_middleware_soa() {
         let mw = DnsMockMiddleware::builder()
             .with_a_record("qq.com", "1.5.6.7".parse().unwrap())
-            .build(SmartDnsConfig::default());
+            .build(RuntimeConfig::default());
 
         let res = mw.lookup_rdata("baidu.com", RecordType::A).await;
 

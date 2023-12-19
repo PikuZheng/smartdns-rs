@@ -9,7 +9,7 @@ use std::io::BufRead;
 
 use crate::collections::DomainMap;
 use crate::dns::{Name, RData};
-use crate::trust_dns::proto::rr::RecordType;
+use crate::libdns::proto::rr::RecordType;
 use chrono::{Local, NaiveDateTime};
 
 pub struct LanClientStore {
@@ -95,11 +95,7 @@ impl FromStr for ClientInfo {
         let s = s.trim();
 
         // skip comments and empty line.
-        if match s.chars().next() {
-            Some(t) if t == '#' => true,
-            None => true,
-            _ => false,
-        } {
+        if matches!(s.chars().next(), Some('#') | None) {
             return Err(());
         }
 
@@ -163,11 +159,7 @@ fn read_lease_file<P: AsRef<Path>>(
         let line = line.trim_start();
 
         // skip comments and empty line.
-        if match line.chars().next() {
-            Some(t) if t == '#' => true,
-            None => true,
-            _ => false,
-        } {
+        if matches!(line.chars().next(), Some('#') | None) {
             continue;
         }
 
@@ -187,7 +179,7 @@ fn read_lease_file<P: AsRef<Path>>(
 
 #[cfg(test)]
 mod tests {
-    use trust_dns_resolver::TryParseIp;
+    use crate::libdns::resolver::TryParseIp;
 
     use super::*;
 

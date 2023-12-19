@@ -3,13 +3,13 @@ use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::str::FromStr;
 
+use crate::libdns::proto::rr::rdata::PTR;
+use crate::libdns::proto::rr::LowerName;
+use crate::libdns::server::authority::{AuthorityObject, LookupOptions};
 use ipnet::IpNet;
-use trust_dns_proto::rr::rdata::PTR;
-use trust_dns_proto::rr::LowerName;
-use trust_dns_server::authority::{AuthorityObject, LookupOptions};
 
 use crate::dns::*;
-use crate::dns_conf::SmartDnsConfig;
+use crate::dns_conf::RuntimeConfig;
 use crate::infra::ipset::IpSet;
 use crate::log::debug;
 use crate::middleware::*;
@@ -21,7 +21,7 @@ pub struct DnsZoneMiddleware {
 }
 
 impl DnsZoneMiddleware {
-    pub fn new(_cfg: &SmartDnsConfig) -> Self {
+    pub fn new(_cfg: &RuntimeConfig) -> Self {
         let catalog = Catalog::new();
 
         let server_net = {
@@ -82,7 +82,7 @@ impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError> for DnsZoneMiddle
             }
 
             if is_current_server {
-                return Ok(Lookup::from_rdata(
+                return Ok(DnsResponse::from_rdata(
                     req.query().original().to_owned(),
                     RData::PTR(PTR(ctx.cfg().server_name())),
                 ));
@@ -98,7 +98,7 @@ impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError> for DnsZoneMiddle
                 if !records.is_empty() {
                     return Ok(DnsResponse::new_with_max_ttl(
                         query.original().to_owned(),
-                        records.into(),
+                        records,
                     ));
                 }
             }

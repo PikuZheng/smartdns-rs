@@ -1,91 +1,41 @@
 use cfg_if::cfg_if;
-use futures::Future;
-use futures_util::future::{abortable, Aborted};
 
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    io,
-    sync::Arc,
-};
+use std::{io, sync::Arc};
 
 use crate::{
-    dns_conf::ServerOpts,
-    dns_error::LookupError,
+    app::App,
+    config::ServerOpts,
+    dns::DnsResponse,
     log::{debug, error, info, warn},
-    third_ext::FutureJoinAllExt,
 };
 
-use trust_dns_proto::{
-    op::{Edns, Header, MessageType, OpCode, ResponseCode},
-    rr::Record,
-};
-
-use trust_dns_server::{
-    authority::{
-        AuthLookup, EmptyLookup, LookupObject, LookupOptions, MessageResponse,
-        MessageResponseBuilder, ZoneType,
+use crate::libdns::{
+    proto::{
+        op::{Edns, Header, MessageType, OpCode, ResponseCode},
+        rr::Record,
+        xfer::SerialMessage,
     },
-    server::{RequestHandler, ResponseHandler, ResponseInfo},
-    store::forwarder::ForwardLookup,
+    server::{
+        authority::{LookupOptions, MessageResponse, MessageResponseBuilder, ZoneType},
+        server::{Protocol, Request, RequestHandler, ResponseHandler, ResponseInfo},
+    },
 };
-pub use trust_dns_server::{server::Request, ServerFuture};
 
 use crate::dns::DnsRequest;
-use crate::dns_mw::DnsMiddlewareHandler;
 
-pub struct ServerRegistry {
-    servers: HashMap<ServerOpts, ServerFuture<ServerHandler>>,
-    handler: Arc<DnsMiddlewareHandler>,
-}
-
-impl ServerRegistry {
-    pub fn new(middleware: Arc<DnsMiddlewareHandler>) -> Self {
-        Self {
-            servers: Default::default(),
-            handler: middleware,
-        }
-    }
-
-    pub fn with_opts(&mut self, opts: ServerOpts) -> &mut ServerFuture<ServerHandler> {
-        match self.servers.entry(opts.clone()) {
-            Entry::Occupied(v) => v.into_mut(),
-            Entry::Vacant(v) => v.insert(ServerFuture::new(ServerHandler {
-                handler: self.handler.clone(),
-                server_opts: opts,
-            })),
-        }
-    }
-
-    pub async fn abort(self) -> Result<(), Aborted> {
-        let (server, abort_handle) = abortable(async move {
-            let _ = self
-                .servers
-                .into_values()
-                .map(|s| s.block_until_done())
-                .join_all()
-                .await;
-        });
-        abort_handle.abort();
-        server.await
-    }
-}
-
-pub struct ServerHandler {
-    handler: Arc<DnsMiddlewareHandler>,
+pub struct DnsServerHandler {
+    app: Arc<App>,
     server_opts: ServerOpts,
 }
 
-impl ServerHandler {
-    pub fn new(handler: Arc<DnsMiddlewareHandler>, server_opts: ServerOpts) -> Self {
-        Self {
-            handler,
-            server_opts,
-        }
+impl DnsServerHandler {
+    pub fn new(app: Arc<App>, server_opts: ServerOpts) -> Self {
+        Self { app, server_opts }
     }
 }
 
 #[async_trait::async_trait]
-impl RequestHandler for ServerHandler {
+impl RequestHandler for DnsServerHandler {
     async fn handle_request<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -156,7 +106,7 @@ impl RequestHandler for ServerHandler {
 
                         let request_header = request.header();
 
-                        let (response_header, sections) = async {
+                        let (response_header, dns_response) = async {
                             let lookup_options = lookup_options_for_edns(request.edns());
 
                             // log algorithms being requested
@@ -177,32 +127,52 @@ impl RequestHandler for ServerHandler {
                             let future = async {
                                 let req: &DnsRequest = &request.into();
 
-                                let lookup_result: Result<Box<dyn LookupObject>, LookupError> =
-                                    match self.handler.search(req, &self.server_opts).await {
-                                        Ok(lookup) => Ok(Box::new(ForwardLookup(lookup))),
-                                        Err(err) => Err(err),
-                                    };
+                                let handler = self.app.get_dns_handler().await;
 
-                                lookup_result
+                                handler.search(req, &self.server_opts).await
                             };
 
-                            let sections = send_forwarded_response(
-                                future,
-                                request_header,
-                                &mut response_header,
-                            )
-                            .await;
+                            // send_forwarded_response
+                            response_header.set_recursion_available(true);
+                            response_header.set_authoritative(false);
 
-                            (response_header, sections)
+                            let dns_response = if !request_header.recursion_desired() {
+                                drop(future);
+                                info!(
+                                    "request disabled recursion, returning no records: {}",
+                                    request_header.id()
+                                );
+                                DnsResponse::empty()
+                            } else {
+                                match future.await {
+                                    Ok(rsp) => rsp,
+                                    Err(e) => {
+                                        if e.is_nx_domain() {
+                                            response_header
+                                                .set_response_code(ResponseCode::NXDomain);
+                                        }
+
+                                        match e.as_soa() {
+                                            Some(soa) => soa,
+                                            None => {
+                                                debug!("error resolving: {}", e);
+                                                DnsResponse::empty()
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+
+                            (response_header, dns_response)
                         }
                         .await;
 
                         let response = MessageResponseBuilder::from_message_request(request).build(
                             response_header,
-                            sections.answers.iter(),
-                            sections.ns.iter(),
-                            sections.soa.iter(),
-                            sections.additionals.iter(),
+                            dns_response.answers(),
+                            dns_response.name_servers(),
+                            Box::new(None.into_iter()),
+                            dns_response.additionals(),
                         );
 
                         let result =
@@ -255,65 +225,9 @@ impl RequestHandler for ServerHandler {
     }
 }
 
-async fn send_forwarded_response(
-    future: impl Future<Output = Result<Box<dyn LookupObject>, LookupError>>,
-    request_header: &Header,
-    response_header: &mut Header,
-) -> LookupSections {
-    response_header.set_recursion_available(true);
-    response_header.set_authoritative(false);
-
-    // Don't perform the recursive query if this is disabled...
-    let answers = if !request_header.recursion_desired() {
-        // cancel the future??
-        // future.cancel();
-        drop(future);
-
-        info!(
-            "request disabled recursion, returning no records: {}",
-            request_header.id()
-        );
-
-        Box::new(EmptyLookup)
-    } else {
-        match future.await {
-            Err(e) => {
-                if e.is_nx_domain() {
-                    response_header.set_response_code(ResponseCode::NXDomain);
-                }
-
-                let res: Box<dyn LookupObject> = match e.as_soa() {
-                    Some(soa) => Box::new(ForwardLookup(soa)),
-                    None => {
-                        debug!("error resolving: {}", e);
-                        Box::new(EmptyLookup)
-                    }
-                };
-
-                res
-            }
-            Ok(rsp) => rsp,
-        }
-    };
-
-    LookupSections {
-        answers,
-        ns: Box::<AuthLookup>::default(),
-        soa: Box::<AuthLookup>::default(),
-        additionals: Box::<AuthLookup>::default(),
-    }
-}
-
-struct LookupSections {
-    answers: Box<dyn LookupObject>,
-    ns: Box<dyn LookupObject>,
-    soa: Box<dyn LookupObject>,
-    additionals: Box<dyn LookupObject>,
-}
-
 async fn send_response<'a, R: ResponseHandler>(
-    _response_edns: Option<Edns>,
-    response: MessageResponse<
+    #[allow(unused_variables)] response_edns: Option<Edns>,
+    #[allow(unused_mut)] mut response: MessageResponse<
         '_,
         'a,
         impl Iterator<Item = &'a Record> + Send + 'a,
@@ -325,6 +239,10 @@ async fn send_response<'a, R: ResponseHandler>(
 ) -> io::Result<ResponseInfo> {
     #[cfg(feature = "dnssec")]
     if let Some(mut resp_edns) = response_edns {
+        use crate::libdns::proto::rr::{
+            dnssec::{Algorithm, SupportedAlgorithms},
+            rdata::opt::EdnsOption,
+        };
         // set edns DAU and DHU
         // send along the algorithms which are supported by this authority
         let mut algorithms = SupportedAlgorithms::default();
@@ -353,6 +271,10 @@ fn lookup_options_for_edns(edns: Option<&Edns>) -> LookupOptions {
 
     cfg_if! {
         if #[cfg(feature = "dnssec")] {
+            use crate::libdns::proto::rr::{
+                dnssec::SupportedAlgorithms,
+                rdata::opt::{EdnsOption, EdnsCode}
+            };
             let supported_algorithms = if let Some(&EdnsOption::DAU(algs)) = edns.option(EdnsCode::DAU)
             {
                algs
@@ -377,5 +299,137 @@ impl ServeFaild for ResponseInfo {
         let mut header = Header::new();
         header.set_response_code(ResponseCode::ServFail);
         header.into()
+    }
+}
+
+impl DnsServerHandler {
+    pub async fn handle<'a>(&self, message: SerialMessage, protocol: Protocol) -> SerialMessage {
+        use crate::libdns::proto::error::ProtoError;
+        use crate::libdns::proto::op::{message, LowerQuery, Query};
+        use crate::libdns::proto::serialize::binary::{BinDecodable, BinDecoder, BinEncoder};
+        use crate::libdns::server::authority::MessageRequest;
+
+        let mut decoder = BinDecoder::new(message.bytes());
+        let src_addr = message.addr();
+
+        match MessageRequest::read(&mut decoder) {
+            Ok(message) if message.message_type() != MessageType::Response => {
+                let id = message.id();
+                let qflags = message.header().flags();
+                let qop_code = message.op_code();
+                let message_type = message.message_type();
+                let is_dnssec = message.edns().map_or(false, Edns::dnssec_ok);
+
+                let request = Request::new(message, src_addr, protocol);
+
+                {
+                    let info = request.request_info();
+                    let query = info.query;
+                    let query_name = query.name();
+                    let query_type = query.query_type();
+                    let query_class = query.query_class();
+                    debug!(
+                        "request:{id} src:{proto}://{addr}#{port} type:{message_type} dnssec:{is_dnssec} {op}:{query}:{qtype}:{class} qflags:{qflags}",
+                        id = id,
+                        proto = protocol,
+                        addr = src_addr.ip(),
+                        port = src_addr.port(),
+                        message_type= message_type,
+                        is_dnssec = is_dnssec,
+                        op = qop_code,
+                        query = query_name,
+                        qtype = query_type,
+                        class = query_class,
+                        qflags = qflags,
+                    );
+                }
+
+                // start process
+                let request_header = request.header();
+                let mut response_header = Header::response_from_request(request_header);
+
+                let dns_response = {
+                    let req = &DnsRequest::from(&request);
+                    let handler = self.app.get_dns_handler().await;
+                    match handler.search(req, &self.server_opts).await {
+                        Ok(lookup) => lookup,
+                        Err(e) => {
+                            if e.is_nx_domain() {
+                                response_header.set_response_code(ResponseCode::NXDomain);
+                            }
+
+                            match e.as_soa() {
+                                Some(soa) => soa,
+                                None => {
+                                    debug!("error resolving: {}", e);
+                                    DnsResponse::empty()
+                                }
+                            }
+                        }
+                    }
+                };
+
+                let response = MessageResponseBuilder::from_message_request(&request).build(
+                    response_header,
+                    dns_response.answers(),
+                    dns_response.name_servers(),
+                    Box::new(None.into_iter()),
+                    dns_response.additionals(),
+                );
+
+                let mut bytes = Vec::with_capacity(512);
+                // mut block
+                {
+                    let mut encoder = BinEncoder::new(&mut bytes);
+                    let _ = response.destructive_emit(&mut encoder);
+                };
+
+                SerialMessage::new(bytes, src_addr)
+            }
+
+            Err(ProtoError { kind, .. }) if kind.as_form_error().is_some() => {
+                // We failed to parse the request due to some issue in the message, but the header is available, so we can respond
+                let (request_header, error) = kind
+                    .into_form_error()
+                    .expect("as form_error already confirmed this is a FormError");
+
+                let query = LowerQuery::query(Query::default());
+
+                // debug for more info on why the message parsing failed
+                debug!(
+                    "request:{id} src:{proto}://{addr}#{port} type:{message_type} {op}:FormError:{error}",
+                    id = request_header.id(),
+                    proto = protocol,
+                    addr = src_addr.ip(),
+                    port = src_addr.port(),
+                    message_type= request_header.message_type(),
+                    op = request_header.op_code(),
+                    error = error,
+                );
+
+                let mut response_header = Header::response_from_request(&request_header);
+                response_header.set_response_code(ResponseCode::FormErr);
+
+                let mut bytes = Vec::with_capacity(512);
+
+                {
+                    let mut encoder = BinEncoder::new(&mut bytes);
+
+                    let _ = message::emit_message_parts(
+                        &response_header,
+                        &mut Box::new([&query].into_iter()),
+                        &mut Box::new(None::<&Record>.into_iter()),
+                        &mut Box::new(None::<&Record>.into_iter()),
+                        &mut Box::new(None::<&Record>.into_iter()),
+                        Default::default(),
+                        Default::default(),
+                        &mut encoder,
+                    );
+                }
+
+                SerialMessage::new(bytes, src_addr)
+            }
+            _ => SerialMessage::new(Vec::with_capacity(0), src_addr),
+        }
     }
 }

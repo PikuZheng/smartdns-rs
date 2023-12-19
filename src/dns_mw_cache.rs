@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::Read;
 use std::num::NonZeroUsize;
 
+use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::path::Path;
@@ -12,200 +13,110 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::dns_conf::SmartDnsConfig;
+use crate::dns_conf::RuntimeConfig;
+use crate::dns_mw::BackgroundQueryTask;
 use crate::dns_mw::DnsMiddlewareHost;
-use crate::trust_dns::resolver::LookupTtl;
+use crate::libdns::proto::error::ProtoResult;
 use crate::{
     dns::*,
+    libdns::proto::{op::Query, rr::DNSClass},
     log::{debug, error, info},
     middleware::*,
-    trust_dns::proto::op::Query,
 };
+use futures_util::Future;
+use futures_util::TryFutureExt;
 use lru::LruCache;
-use tokio::sync::MutexGuard;
+use tokio::sync::Notify;
+use tokio::time::sleep;
 use tokio::{
-    sync::{mpsc, Mutex, Notify},
-    time::sleep,
+    sync::{mpsc, Mutex, RwLock},
+    task::JoinError,
 };
-use trust_dns_proto::error::ProtoResult;
 
 pub struct DnsCacheMiddleware {
-    cache: Mutex<HybridDomainCache>,
+    cfg: Arc<RuntimeConfig>,
+    cache: Arc<DnsCache>,
+    client: RwLock<Option<Arc<DnsMiddlewareHost>>>,
+    prefetch_notify: RwLock<Option<Arc<DomainPrefetchingNotify>>>,
 }
 
 impl DnsCacheMiddleware {
-    pub fn new() -> Self {
-        Self {
-            cache: Mutex::new(HybridDomainCache::None),
+    pub fn new(cfg: &Arc<RuntimeConfig>) -> Self {
+        // create
+        let mut ttl = TtlOpts::default();
+
+        if let Some(positive_min_ttl) = cfg.rr_ttl_min().map(Duration::from_secs) {
+            ttl.set_positive_min(positive_min_ttl);
         }
-    }
 
-    async fn get_cache(
-        &self,
-        cfg: &Arc<SmartDnsConfig>,
-        rest: Option<&Next<'_, DnsContext, DnsRequest, DnsResponse, DnsError>>,
-    ) -> MutexGuard<HybridDomainCache> {
-        let mut cache = self.cache.lock().await;
+        if let Some(positive_max_ttl) = cfg.rr_ttl_max().map(Duration::from_secs) {
+            ttl.set_positive_min(positive_max_ttl);
+        }
+        ttl.set_negative_max(Duration::from_secs(cfg.serve_expired_ttl()));
+        ttl.set_negative_min(Duration::from_secs(cfg.serve_expired_reply_ttl()));
 
-        if cache.is_none() {
-            // create
-            let mut ttl = TtlOpts::default();
+        let cache = DnsCache::new(cfg.cache_size(), ttl);
 
-            if let Some(positive_min_ttl) = cfg.rr_ttl_min().map(Duration::from_secs) {
-                ttl.set_positive_min(positive_min_ttl);
+        if cfg.cache_persist() {
+            let cache_file = cfg.cache_file();
+            let cache = cache.cache();
+            if cache_file.exists() {
+                cache.blocking_lock().load(cache_file.as_path());
             }
-
-            if let Some(positive_max_ttl) = cfg.rr_ttl_max().map(Duration::from_secs) {
-                ttl.set_positive_min(positive_max_ttl);
-            }
-            ttl.set_negative_max(Duration::from_secs(cfg.serve_expired_ttl()));
-            ttl.set_negative_min(Duration::from_secs(cfg.serve_expired_reply_ttl()));
-
-            let new_cache = DnsLruCache::new(cfg.cache_size(), ttl);
-
-            if cfg.cache_persist() {
-                let cache_file = cfg.cache_file();
-                let cache = new_cache.cache();
-                if cache_file.exists() {
-                    cache.lock().await.load(cache_file.as_path());
-                }
-                tokio::spawn(async move {
-                    crate::signal::terminate()
-                        .await
-                        .expect("failed to wait ctrl_c for persist cache.");
-                    cache.lock().await.persist(cache_file.as_path());
-                });
-            }
-
-            let new_cache = if cfg.prefetch_domain() {
-                let prefetcher =
-                    DomainPrefetcher::new(new_cache, rest.unwrap().into(), cfg.clone());
-                prefetcher.start();
-                HybridDomainCache::Prefetch(prefetcher)
-            } else {
-                HybridDomainCache::Lru(new_cache)
-            };
-            *cache.deref_mut() = new_cache;
+            tokio::spawn(async move {
+                crate::signal::terminate()
+                    .await
+                    .expect("failed to wait ctrl_c for persist cache.");
+                cache.lock().await.persist(cache_file.as_path());
+            });
         }
-        cache
-    }
-}
-
-#[async_trait::async_trait]
-impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError> for DnsCacheMiddleware {
-    async fn handle(
-        &self,
-        ctx: &mut DnsContext,
-        req: &DnsRequest,
-        next: Next<'_, DnsContext, DnsRequest, DnsResponse, DnsError>,
-    ) -> Result<DnsResponse, DnsError> {
-        // skip cache
-        if ctx.server_opts.no_cache() || ctx.no_cache {
-            return next.run(ctx, req).await;
-        }
-
-        let query = req.query();
-
-        let query = query.original().to_owned();
-
-        let cached_res = self
-            .get_cache(ctx.cfg(), Some(&next))
-            .await
-            .get(&query, Instant::now())
-            .await;
-
-        if let Some((OutOfDate::No, res)) = cached_res.as_ref() {
-            debug!("name: {} using caching", query.name());
-            ctx.source = LookupFrom::Cache;
-            return res.clone();
-        }
-
-        let res = next.run(ctx, req).await;
-
-        match res {
-            Ok(lookup) => {
-                if !ctx.no_cache {
-                    self.get_cache(ctx.cfg(), None)
-                        .await
-                        .insert_records(query, lookup.records().iter().cloned(), Instant::now())
-                        .await;
-                }
-                Ok(lookup)
-            }
-            Err(err) => {
-                // try to return expired result.
-                if ctx.cfg().serve_expired() {
-                    if let Some((OutOfDate::Yes, Ok(lookup))) = cached_res {
-                        Ok(lookup)
-                    } else {
-                        Err(err)
-                    }
-                } else {
-                    Err(err)
-                }
-            }
-        }
-    }
-}
-
-enum HybridDomainCache {
-    None,
-    Prefetch(DomainPrefetcher),
-    Lru(DnsLruCache),
-}
-
-impl HybridDomainCache {
-    fn is_none(&self) -> bool {
-        matches!(self, HybridDomainCache::None)
-    }
-}
-
-impl Deref for HybridDomainCache {
-    type Target = DnsLruCache;
-
-    fn deref(&self) -> &Self::Target {
-        use HybridDomainCache::*;
-
-        match self {
-            Prefetch(v) => &v.cache,
-            Lru(v) => v,
-            None => panic!("Cache not initialized."),
-        }
-    }
-}
-
-struct DomainPrefetcher {
-    cfg: Arc<SmartDnsConfig>,
-    cache: DnsLruCache,
-    client: Arc<DnsMiddlewareHost>,
-    prefetch_notify: Arc<Notify>,
-}
-
-impl DomainPrefetcher {
-    fn new(cache: DnsLruCache, client: DnsMiddlewareHost, cfg: Arc<SmartDnsConfig>) -> Self {
-        let prefetch_notify = cache.prefetch_notify.clone();
 
         Self {
-            cache,
-            prefetch_notify,
-            client: Arc::new(client),
-            cfg,
+            cfg: cfg.clone(),
+            cache: Arc::new(cache),
+            client: RwLock::new(Default::default()),
+            prefetch_notify: RwLock::new(Default::default()),
         }
     }
 
-    fn cache(&self) -> &Arc<Mutex<LruCache<Query, DnsCacheEntry>>> {
-        &self.cache.cache
+    pub fn cache(&self) -> &Arc<DnsCache> {
+        &self.cache
     }
 
-    fn start(&self) {
+    async fn start_prefetching(&self) {
+        let prefetch_notify = {
+            let notify = self.prefetch_notify.read().await;
+            if notify.is_some() {
+                return;
+            }
+            drop(notify);
+
+            let mut notify = self.prefetch_notify.write().await;
+            if notify.is_some() {
+                return;
+            }
+            let prefetch_notify = Arc::new(DomainPrefetchingNotify::new());
+            *notify.deref_mut() = Some(prefetch_notify.clone());
+            prefetch_notify
+        };
+
         let (tx, mut rx) = mpsc::channel::<Vec<Query>>(100);
 
-        let client = self.client.clone();
+        let client = match self.client.read().await.clone() {
+            Some(client) => client,
+            None => {
+                error!("skip domain prefetch");
+                return;
+            }
+        };
+
+        let cache = self.cache.cache();
 
         {
             // prefetch domain.
-            let cache = self.cache().clone();
+            let cache = cache.clone();
             let cfg = self.cfg.clone();
+            let prefetch_notify = prefetch_notify.clone();
 
             tokio::spawn(async move {
                 let querying: Arc<Mutex<HashSet<Query>>> = Default::default();
@@ -231,40 +142,44 @@ impl DomainPrefetcher {
                                 query.query_type(),
                             );
 
-                            tokio::spawn(async move {
-                                let now = Instant::now();
-                                let mut ctx =
-                                    DnsContext::new(query.name(), cfg.clone(), Default::default());
+                            let mut bg_task =
+                                BackgroundQueryTask::from_query(query, cfg.clone(), client);
+                            bg_task.ctx.background = true;
+                            let now = Instant::now();
 
-                                ctx.background = true;
+                            let prefetch_notify = prefetch_notify.clone();
+                            let _ = bg_task
+                                .spawn()
+                                .and_then(|(t, res)| async move {
+                                    let query = t.req.query().original();
+                                    if let Ok(lookup) = res {
+                                        let min_ttl = lookup
+                                            .records()
+                                            .iter()
+                                            .min_by_key(|r| r.ttl())
+                                            .map(|r| Duration::from_secs(u64::from(r.ttl())));
 
-                                if let Ok(lookup) =
-                                    client.execute(&mut ctx, &query.clone().into()).await
-                                {
-                                    let min_ttl = lookup
-                                        .records()
-                                        .iter()
-                                        .min_by_key(|r| r.ttl())
-                                        .map(|r| Duration::from_secs(u64::from(r.ttl())));
+                                        debug!(
+                                            "Prefetch domain {} {}, elapsed {:?}, ttl {:?}",
+                                            name,
+                                            typ,
+                                            now.elapsed(),
+                                            min_ttl.unwrap_or_default()
+                                        );
 
-                                    debug!(
-                                        "prefetch domain {} {}, elapsed {:?}, ttl {:?}",
-                                        name,
-                                        typ,
-                                        now.elapsed(),
-                                        min_ttl.unwrap_or_default()
-                                    );
-
-                                    if let Some(min_ttl) = min_ttl {
-                                        if let Some(entry) = cache.lock().await.peek_mut(&query) {
-                                            entry.valid_until = now + min_ttl;
-                                            entry.lookup = Ok(lookup);
+                                        if let Some(min_ttl) = min_ttl {
+                                            if let Some(entry) = cache.lock().await.peek_mut(query)
+                                            {
+                                                entry.valid_until = Instant::now() + min_ttl;
+                                                entry.lookup = Ok(lookup);
+                                                prefetch_notify.notify_after(min_ttl).await;
+                                            }
                                         }
                                     }
-                                }
-
-                                querying.lock().await.remove(&query);
-                            });
+                                    querying.lock().await.remove(query);
+                                    Ok(())
+                                })
+                                .await;
                         }
                     }
                 }
@@ -273,75 +188,219 @@ impl DomainPrefetcher {
 
         {
             // check expired domain.
-            let cache = self.cache().clone();
-
-            let prefetch_notify = self.prefetch_notify.clone();
-
-            const MIN_INTERVAL: Duration = Duration::from_secs(1);
-            const MIN_TTL: Duration = Duration::from_secs(5);
+            let cache = cache.clone();
+            let prefetch_notify = prefetch_notify.clone();
 
             tokio::spawn(async move {
+                const MIN_INTERVAL: Duration = Duration::from_secs(1);
                 let mut last_check = Instant::now();
 
                 loop {
                     prefetch_notify.notified().await;
+
                     let now = Instant::now();
-                    if now - last_check < MIN_INTERVAL {
-                        continue;
-                    }
+                    let mut most_recent;
+                    if now - last_check > MIN_INTERVAL {
+                        last_check = now;
 
-                    last_check = now;
-                    let mut most_recent = Duration::from_secs(MAX_TTL as u64);
+                        most_recent = Duration::from_secs(MAX_TTL as u64);
+                        let mut expired = vec![];
 
-                    let mut expired = vec![];
-
-                    {
-                        let cache = cache.lock().await;
-                        let len = cache.len();
-                        if len == 0 {
-                            continue;
-                        }
-
-                        for (query, entry) in cache.iter() {
-                            // only prefetch query type ip addr
-                            if !query.query_type().is_ip_addr() {
+                        {
+                            let cache = cache.lock().await;
+                            let len = cache.len();
+                            if len == 0 {
                                 continue;
                             }
 
-                            if entry.is_current(now) {
-                                let ttl = entry.ttl(now);
-                                most_recent = most_recent.min(ttl);
-                                continue;
-                            }
+                            for (query, entry) in cache.iter() {
+                                // only prefetch query type ip addr
+                                if !query.query_type().is_ip_addr() {
+                                    continue;
+                                }
 
-                            expired.push(query.to_owned());
+                                if entry.is_current(now) {
+                                    most_recent = most_recent.min(entry.ttl(now));
+                                    continue;
+                                }
+
+                                expired.push(query.to_owned());
+                            }
+                            debug!(
+                                "Domain prefetch check(total: {}), elapsed {:?}",
+                                len,
+                                now.elapsed()
+                            );
                         }
-                        debug!(
-                            "check prefetch domains(total: {}) elapsed {:?}",
-                            len,
-                            now.elapsed()
-                        );
+
+                        if !expired.is_empty() && tx.send(expired).await.is_err() {
+                            error!("Failed to send queries to prefetch domain!",);
+                        }
+                    } else {
+                        most_recent = Duration::ZERO;
                     }
 
-                    if !expired.is_empty() {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            if tx.send(expired).await.is_err() {
-                                error!("failed to send queries to prefetch domain!",);
-                            }
-                        });
-                    }
-
-                    let prefetch_notify = prefetch_notify.clone();
-                    tokio::spawn(async move {
-                        let dura = most_recent.max(MIN_INTERVAL);
-                        debug!("Check domain prefetch after {:?} seconds", dura);
-                        sleep(dura).await;
-                        prefetch_notify.notify_one();
-                    });
+                    // sleep and wait for next check.
+                    let dura = most_recent.max(MIN_INTERVAL);
+                    prefetch_notify.notify_after(dura).await;
                 }
             });
         }
+    }
+
+    async fn bg_fetch(
+        &self,
+        ctx: &mut DnsContext,
+        req: &DnsRequest,
+        cached_res: Option<DnsResponse>,
+    ) -> Result<
+        impl Future<Output = Result<(BackgroundQueryTask, Result<DnsResponse, DnsError>), JoinError>>,
+        DnsError,
+    > {
+        let client = self.client.read().await.clone().ok_or_else(|| {
+            DnsError::from(ResolveErrorKind::Message("get client for caching failed."))
+        })?;
+
+        let bg_task = BackgroundQueryTask::new(ctx, req, client);
+
+        let cache = self.cache.clone();
+
+        let prefetch_notify = self.prefetch_notify.read().await.clone();
+
+        Ok(bg_task.spawn().and_then(|(task, res)| async move {
+            let ctx = &task.ctx;
+            let req = &task.req;
+            let res = match res {
+                Ok(lookup) => {
+                    if !ctx.no_cache {
+                        let query = req.query().original().to_owned();
+
+                        cache
+                            .insert_records(query, lookup.records().iter().cloned(), Instant::now())
+                            .await;
+
+                        if let (Some(n), Some(ttl)) = (prefetch_notify, lookup.min_ttl()) {
+                            n.notify_after(Duration::from_secs(ttl as u64)).await;
+                        }
+                    }
+                    Ok(lookup)
+                }
+                Err(err) => {
+                    // try to return expired result.
+                    if ctx.cfg().serve_expired() {
+                        if let Some(lookup) = cached_res {
+                            Ok(lookup)
+                        } else {
+                            Err(err)
+                        }
+                    } else {
+                        Err(err)
+                    }
+                }
+            };
+
+            Ok((task, res))
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError> for DnsCacheMiddleware {
+    async fn handle(
+        &self,
+        ctx: &mut DnsContext,
+        req: &DnsRequest,
+        next: Next<'_, DnsContext, DnsRequest, DnsResponse, DnsError>,
+    ) -> Result<DnsResponse, DnsError> {
+        // skip cache
+        if ctx.server_opts.no_cache() || ctx.no_cache || req.is_dnssec() {
+            return next.run(ctx, req).await;
+        }
+
+        // try create client for fetching result.
+        {
+            let client = self.client.read().await;
+            if client.is_none() {
+                drop(client);
+                let mut client = self.client.write().await;
+                *client.deref_mut() = Some(Arc::new(DnsMiddlewareHost::from(&next)));
+                drop(client);
+
+                if ctx.cfg().prefetch_domain() {
+                    self.start_prefetching().await;
+                }
+            }
+        }
+
+        let query = req.query().original().to_owned();
+
+        let cached_res = self.cache.get(&query, Instant::now()).await;
+
+        let bg_task = {
+            let cached_res = cached_res.as_ref().and_then(|c| c.1.clone().ok());
+            self.bg_fetch(ctx, req, cached_res).await
+        };
+
+        if let Some((OutOfDate::No, res)) = cached_res.as_ref() {
+            debug!("name: {} using caching", query.name());
+            ctx.source = LookupFrom::Cache;
+            return res.clone();
+        }
+
+        match bg_task?.await {
+            Ok((task, res)) => {
+                *ctx = task.ctx;
+                res
+            }
+            Err(err) => Err(DnsError::from(ResolveErrorKind::Msg(err.to_string()))),
+        }
+    }
+}
+
+struct DomainPrefetchingNotify {
+    notity: Arc<Notify>,
+    tick: RwLock<Instant>,
+}
+
+impl DomainPrefetchingNotify {
+    pub fn new() -> Self {
+        Self {
+            notity: Default::default(),
+            tick: RwLock::new(Instant::now()),
+        }
+    }
+
+    async fn notify_after(&self, duration: Duration) {
+        if duration.is_zero() {
+            self.notity.notify_one()
+        } else {
+            let now = Instant::now();
+            let tick = *(self.tick.read().await);
+            let next_tick = now + duration;
+            if tick > now && next_tick > tick {
+                debug!(
+                    "Domain prefetch check will be performed in {:?}.",
+                    tick - now
+                );
+                return;
+            }
+
+            *self.tick.write().await.deref_mut() = next_tick;
+            debug!("Domain prefetch check will be performed in {:?}.", duration);
+            let notify = self.notity.clone();
+            tokio::spawn(async move {
+                sleep(duration).await;
+                notify.notify_one();
+            });
+        }
+    }
+}
+
+impl Deref for DomainPrefetchingNotify {
+    type Target = Notify;
+
+    fn deref(&self) -> &Self::Target {
+        self.notity.as_ref()
     }
 }
 
@@ -350,25 +409,18 @@ impl DomainPrefetcher {
 const MAX_TTL: u32 = 86400_u32;
 
 /// An LRU eviction cache specifically for storing DNS records
-struct DnsLruCache {
+pub struct DnsCache {
     cache: Arc<Mutex<LruCache<Query, DnsCacheEntry>>>,
-
     ttl: TtlOpts,
-
-    prefetch_notify: Arc<Notify>,
 }
 
-impl DnsLruCache {
+impl DnsCache {
     fn new(cache_size: usize, ttl: TtlOpts) -> Self {
         let cache = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(cache_size).unwrap(),
         )));
 
-        Self {
-            cache,
-            ttl,
-            prefetch_notify: Default::default(),
-        }
+        Self { cache, ttl }
     }
 
     fn cache(&self) -> Arc<Mutex<LruCache<Query, DnsCacheEntry>>> {
@@ -377,8 +429,25 @@ impl DnsLruCache {
 
     // fn insert
 
-    async fn clear(&self) {
+    pub async fn clear(&self) {
         self.cache.lock().await.clear();
+    }
+
+    pub async fn cached_records(&self) -> Vec<CachedQueryRecord> {
+        self.cache
+            .lock()
+            .await
+            .iter()
+            .flat_map(|(query, v)| match &v.lookup {
+                Ok(lookup) => Some(CachedQueryRecord {
+                    name: query.name().clone(),
+                    query_type: query.query_type(),
+                    query_class: query.query_class(),
+                    records: lookup.records().to_vec().into_boxed_slice(),
+                }),
+                Err(_) => None,
+            })
+            .collect()
     }
 
     async fn insert(
@@ -386,7 +455,7 @@ impl DnsLruCache {
         query: Query,
         records_and_ttl: Vec<(Record, u32)>,
         now: Instant,
-    ) -> Lookup {
+    ) -> DnsResponse {
         let len = records_and_ttl.len();
         // collapse the values, we're going to take the Minimum TTL as the correct one
         let (records, ttl): (Vec<Record>, Duration) = records_and_ttl.into_iter().fold(
@@ -407,9 +476,7 @@ impl DnsLruCache {
         let valid_until = now + ttl;
 
         // insert into the LRU
-        let lookup = Lookup::new_with_deadline(query.clone(), Arc::from(records), valid_until);
-
-        self.notify_prefetch_domain(ttl);
+        let lookup = DnsResponse::new_with_deadline(query.clone(), records, valid_until);
 
         if let Ok(mut cache) = self.cache.try_lock() {
             cache.put(
@@ -442,7 +509,8 @@ impl DnsLruCache {
         original_query: Query,
         records: impl Iterator<Item = Record>,
         now: Instant,
-    ) -> Option<Lookup> {
+    ) -> Option<DnsResponse> {
+        let mut is_cname_query = false;
         // collect all records by name
         let records = records.fold(
             HashMap::<Query, Vec<(Record, u32)>>::new(),
@@ -452,9 +520,11 @@ impl DnsLruCache {
 
                 let ttl = record.ttl();
 
-                map.entry(query)
-                    .or_insert_with(Vec::default)
-                    .push((record, ttl));
+                if original_query != query {
+                    is_cname_query = true;
+                }
+
+                map.entry(query).or_default().push((record, ttl));
 
                 map
             },
@@ -462,6 +532,16 @@ impl DnsLruCache {
 
         // now insert by record type and name
         let mut lookup = None;
+
+        if is_cname_query {
+            let records = records
+                .clone()
+                .into_iter()
+                .flat_map(|(_, r)| r)
+                .collect::<Vec<_>>();
+            lookup = Some(self.insert(original_query.clone(), records, now).await)
+        }
+
         for (query, records_and_ttl) in records {
             let is_query = original_query == query;
             let inserted = self.insert(query, records_and_ttl, now).await;
@@ -495,7 +575,7 @@ impl DnsLruCache {
         &self,
         query: &Query,
         now: Instant,
-    ) -> Option<(OutOfDate, Result<Lookup, DnsError>)> {
+    ) -> Option<(OutOfDate, Result<DnsResponse, DnsError>)> {
         let mut cache = match self.cache.try_lock() {
             Ok(t) => t,
             Err(err) => {
@@ -534,18 +614,14 @@ impl DnsLruCache {
         }
         lookup
     }
+}
 
-    fn notify_prefetch_domain(&self, duration: Duration) {
-        if duration.is_zero() {
-            return;
-        }
-
-        let prefetch_notify = self.prefetch_notify.clone();
-        tokio::spawn(async move {
-            sleep(duration).await;
-            prefetch_notify.notify_one();
-        });
-    }
+#[derive(Deserialize, Serialize)]
+pub struct CachedQueryRecord {
+    name: Name,
+    query_type: RecordType,
+    query_class: DNSClass,
+    records: Box<[Record]>,
 }
 
 struct TtlOpts {
@@ -642,7 +718,7 @@ enum OutOfDate {
 }
 
 struct DnsCacheEntry {
-    lookup: Result<Lookup, DnsError>,
+    lookup: Result<DnsResponse, DnsError>,
     valid_until: Instant,
 }
 
@@ -659,17 +735,18 @@ impl DnsCacheEntry {
 }
 
 mod lookup {
+
+    use crate::dns::DnsResponse;
+    use std::ops::Deref;
     use std::time::Instant;
 
-    use trust_dns_proto::error::ProtoResult;
-    use trust_dns_proto::{
-        op::Query,
-        rr::Record,
+    use crate::libdns::proto::{
+        error::ProtoResult,
+        op::Message,
         serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder},
     };
-    use trust_dns_resolver::lookup::Lookup;
 
-    pub fn serialize(lookups: &[Lookup], writer: &mut impl std::io::Write) -> ProtoResult<()> {
+    pub fn serialize(lookups: &[DnsResponse], writer: &mut impl std::io::Write) -> ProtoResult<()> {
         let mut buf = vec![];
         for lookup in lookups {
             {
@@ -683,7 +760,7 @@ mod lookup {
         Ok(())
     }
 
-    pub fn deserialize(data: &[u8]) -> ProtoResult<Vec<Lookup>> {
+    pub fn deserialize(data: &[u8]) -> ProtoResult<Vec<DnsResponse>> {
         let mut lookups = vec![];
         let mut offset = 0;
 
@@ -695,45 +772,27 @@ mod lookup {
 
         Ok(lookups)
     }
-    pub fn serialize_one(lookup: &Lookup, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
-        lookup.query().emit(encoder)?;
-
+    pub fn serialize_one(res: &DnsResponse, encoder: &mut BinEncoder<'_>) -> ProtoResult<()> {
         let valid_until_bytes = unsafe {
             std::slice::from_raw_parts(
-                (&lookup.valid_until() as *const Instant) as *const u8,
+                (&res.valid_until() as *const Instant) as *const u8,
                 ::std::mem::size_of::<Instant>(),
             )
         };
         encoder.emit_vec(valid_until_bytes)?;
-
-        encoder.emit_u8(lookup.records().len() as u8)?;
-
-        for record in lookup.records() {
-            record.emit(encoder)?
-        }
-
+        res.deref().emit(encoder)?;
         Ok(())
     }
 
-    pub fn deserialize_one(decoder: &mut BinDecoder<'_>) -> ProtoResult<Lookup> {
-        let query = Query::read(decoder)?;
-
+    pub fn deserialize_one(decoder: &mut BinDecoder<'_>) -> ProtoResult<DnsResponse> {
         let valid_until_bytes = decoder
             .read_slice(std::mem::size_of::<Instant>())?
             .unverified();
-
         let valid_until = unsafe { std::ptr::read(valid_until_bytes.as_ptr() as *const Instant) };
 
-        let count = decoder.read_u8()?.unverified();
-        let mut records = vec![];
-        for _ in 0..count {
-            records.push(Record::read(decoder)?);
-        }
-        Ok(Lookup::new_with_deadline(
-            query,
-            records.into(),
-            valid_until,
-        ))
+        let message = Message::read(decoder)?;
+        let res: DnsResponse = message.into();
+        Ok(res.with_valid_until(valid_until))
     }
 }
 
@@ -746,7 +805,7 @@ trait PersistCache {
 impl PersistCache for LruCache<Query, DnsCacheEntry> {
     fn persist<P: AsRef<Path>>(&self, path: P) {
         let path = path.as_ref();
-        fn cache_to_file(lookups: &[Lookup], path: &Path) -> ProtoResult<()> {
+        fn cache_to_file(lookups: &[DnsResponse], path: &Path) -> ProtoResult<()> {
             let mut file = File::options()
                 .create(true)
                 .truncate(true)
@@ -773,7 +832,7 @@ impl PersistCache for LruCache<Query, DnsCacheEntry> {
         info!("reading DNS cache from file: {:?}", path);
         let now = Instant::now();
 
-        fn read_from_cache_file(path: &Path) -> ProtoResult<Vec<Lookup>> {
+        fn read_from_cache_file(path: &Path) -> ProtoResult<Vec<DnsResponse>> {
             let mut file = File::options().read(true).open(path)?;
             let mut data = vec![];
             file.read_to_end(&mut data)?;
@@ -811,13 +870,13 @@ mod tests {
 
     use super::*;
 
-    fn create_lookup(name: &str, rr_type: RecordType, ttl: u64) -> Lookup {
+    fn create_lookup(name: &str, rr_type: RecordType, ttl: u64) -> DnsResponse {
         let name: Name = name.parse().unwrap();
         let ttl = Duration::from_secs(ttl);
         let query = Query::query(name.clone(), rr_type);
         let records = vec![Record::with(name, rr_type, ttl.as_secs() as u32)];
         let valid_until = Instant::now() + ttl;
-        Lookup::new_with_deadline(query, records.into(), valid_until)
+        DnsResponse::new_with_deadline(query, records, valid_until)
     }
 
     #[test]
@@ -843,7 +902,7 @@ mod tests {
             let lookup1 = create_lookup("abc.exmample.com.", RecordType::A, 3000);
             let lookup2 = create_lookup("xyz.exmample.com.", RecordType::A, 3000);
 
-            let cache = DnsLruCache::new(10, TtlOpts::default());
+            let cache = DnsCache::new(10, TtlOpts::default());
 
             let now = Instant::now();
 

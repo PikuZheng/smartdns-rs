@@ -1,10 +1,8 @@
+use crate::dns::DnsResponse;
+use crate::libdns::proto::{error::ProtoError, op::ResponseCode};
+use crate::libdns::resolver::error::{ResolveError, ResolveErrorKind};
 use std::{io, sync::Arc};
 use thiserror::Error;
-use trust_dns_proto::{error::ProtoError, op::ResponseCode};
-use trust_dns_resolver::{
-    error::{ResolveError, ResolveErrorKind},
-    lookup::Lookup,
-};
 
 #[allow(clippy::large_enum_variant)]
 /// A query could not be fulfilled
@@ -21,10 +19,10 @@ pub enum LookupError {
     #[error("Forward resolution error: {0}")]
     ResolveError(#[from] ResolveError),
     /// Recursive Resolver Error
-    #[cfg(feature = "trust-dns-recursor")]
+    #[cfg(feature = "hickory-recursor")]
     #[cfg_attr(docsrs, doc(cfg(feature = "recursor")))]
     #[error("Recursive resolution error: {0}")]
-    RecursiveError(#[from] trust_dns_recursor::Error),
+    RecursiveError(#[from] create::libdns::recursor::Error),
     /// An underlying IO error occurred
     #[error("io error: {0}")]
     Io(Arc<io::Error>),
@@ -40,7 +38,7 @@ impl LookupError {
         self.as_soa().is_some()
     }
 
-    pub fn as_soa(&self) -> Option<Lookup> {
+    pub fn as_soa(&self) -> Option<DnsResponse> {
         if let Self::ResolveError(err) = self {
             if let ResolveErrorKind::NoRecordsFound {
                 query,
@@ -48,10 +46,10 @@ impl LookupError {
                 ..
             } = err.kind()
             {
-                return Some(Lookup::new_with_max_ttl(
+                return Some(DnsResponse::new_with_max_ttl(
                     query.as_ref().to_owned(),
-                    vec![record.as_ref().to_owned().into_record_of_rdata()].into(),
-                ));
+                    vec![record.as_ref().to_owned().into_record_of_rdata()],
+                )); // todo:// SOA nameservers
             }
         }
         None

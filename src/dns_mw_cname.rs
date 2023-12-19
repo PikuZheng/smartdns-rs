@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
-use trust_dns_proto::rr::rdata::CNAME;
+use crate::libdns::proto::rr::rdata::CNAME;
 
+use crate::config::CName;
 use crate::dns::*;
-use crate::dns_rule::CNameRule;
 use crate::middleware::*;
 
 pub struct DnsCNameMiddleware;
@@ -19,8 +19,8 @@ impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError> for DnsCNameMiddl
         let cname = match &ctx.domain_rule {
             Some(rule) => rule.get(|r| match &r.cname {
                 Some(cname) => match cname {
-                    CNameRule::Ignore => None,
-                    CNameRule::Name(n) => Some(n.clone()),
+                    CName::IGN => None,
+                    CName::Value(n) => Some(n.clone()),
                 },
                 None => None,
             }),
@@ -42,11 +42,7 @@ impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError> for DnsCNameMiddl
                         RData::CNAME(CNAME(cname.clone())),
                     )];
 
-                    Ok(Lookup::new_with_deadline(
-                        query,
-                        records.into(),
-                        valid_until,
-                    ))
+                    Ok(DnsResponse::new_with_deadline(query, records, valid_until))
                 } else {
                     let mut ctx =
                         DnsContext::new(&cname, ctx.cfg().clone(), ctx.server_opts().clone());

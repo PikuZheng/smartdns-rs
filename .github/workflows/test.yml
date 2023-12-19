@@ -36,6 +36,15 @@ jobs:
           toolchain: stable
           target: ${{ matrix.target }}
           override: true
+      
+      - name: cargo install patch-crate
+        uses: baptiste0928/cargo-install@v2
+        with:
+          crate: patch-crate
+          
+      - name: Patch crates
+        run: cargo patch-crate
+        shell: bash
           
       - name: Test
         uses: actions-rs/cargo@v1.0.3
@@ -66,6 +75,16 @@ jobs:
           components: rustfmt, clippy
           target: ${{ matrix.target }}
           override: true
+
+      - name: cargo install patch-crate
+        uses: baptiste0928/cargo-install@v2
+        with:
+          crate: patch-crate
+          
+      - name: Patch crates
+        run: cargo patch-crate
+        shell: bash
+
       - name: Clippy
         run: cargo clippy
       - name: Rustfmt
@@ -128,18 +147,28 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@master
+
       - name: Install Rust Toolchain Components
         uses: actions-rs/toolchain@v1.0.7
         with:
           toolchain: stable
           target: ${{ matrix.target }}
           override: true
+
+      - name: cargo install patch-crate
+        uses: baptiste0928/cargo-install@v2
+        with:
+          crate: patch-crate
+          
+      - name: Patch crates
+        run: cargo patch-crate
+        shell: bash
+
       - name: Check
         uses: actions-rs/cargo@v1
         with:
           use-cross: ${{ matrix.os == 'ubuntu-latest' }}
           command: check
           args: --workspace --tests --benches --examples --target ${{ matrix.target }}
-
 
 

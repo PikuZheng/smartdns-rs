@@ -2,10 +2,10 @@ use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use crate::dns::*;
+use crate::libdns::proto::rr::{RData, RecordType};
 use crate::middleware::*;
-use crate::trust_dns::proto::rr::{RData, RecordType};
 
-use crate::trust_dns::resolver::TtlClip;
+use crate::libdns::resolver::TtlClip;
 
 #[derive(Debug)]
 pub struct AddressMiddleware;
@@ -33,9 +33,9 @@ impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError> for AddressMiddle
             let name = query.name().to_owned();
             let valid_until = Instant::now() + Duration::from_secs(local_ttl);
 
-            let lookup = Lookup::new_with_deadline(
+            let lookup = DnsResponse::new_with_deadline(
                 query,
-                vec![Record::from_rdata(name, local_ttl as u32, rdata)].into(),
+                vec![Record::from_rdata(name, local_ttl as u32, rdata)],
                 valid_until,
             );
 
@@ -74,9 +74,9 @@ impl Middleware<DnsContext, DnsRequest, DnsResponse, DnsError> for AddressMiddle
                 }
 
                 match records {
-                    Cow::Owned(records) => Lookup::new_with_deadline(
+                    Cow::Owned(records) => DnsResponse::new_with_deadline(
                         lookup.query().clone(),
-                        records.to_vec().into(),
+                        records,
                         lookup.valid_until(),
                     ),
                     Cow::Borrowed(_) => lookup,
@@ -143,14 +143,13 @@ mod tests {
     use super::*;
 
     use crate::{
-        dns_conf::{DomainAddress, SmartDnsConfig},
+        dns_conf::{DomainAddress, RuntimeConfig},
         dns_mw::*,
-        trust_dns::resolver::LookupTtl,
     };
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_address_rule_soa_v6() {
-        let cfg = SmartDnsConfig::builder()
+        let cfg = RuntimeConfig::builder()
             .with("domain-rule /google.com/ -address #6")
             .build();
 
@@ -182,7 +181,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ttl_clip_ttl_min() -> Result<(), DnsError> {
-        let cfg = SmartDnsConfig::builder().with("rr-ttl-min 50").build();
+        let cfg = RuntimeConfig::builder().with("rr-ttl-min 50").build();
 
         let mock = DnsMockMiddleware::mock(AddressMiddleware)
             .with_multi_records(
@@ -212,7 +211,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ttl_clip_ttl_max() -> Result<(), DnsError> {
-        let cfg = SmartDnsConfig::builder().with("rr-ttl-max 50").build();
+        let cfg = RuntimeConfig::builder().with("rr-ttl-max 50").build();
 
         let mock = DnsMockMiddleware::mock(AddressMiddleware)
             .with_multi_records(
@@ -242,7 +241,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ttl_clip_ttl_min_max() -> Result<(), DnsError> {
-        let cfg = SmartDnsConfig::builder()
+        let cfg = RuntimeConfig::builder()
             .with("rr-ttl-max 66")
             .with("rr-ttl-min 55")
             .build();
@@ -275,7 +274,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ttl_clip_ttl_max_reply() -> Result<(), DnsError> {
-        let cfg = SmartDnsConfig::builder()
+        let cfg = RuntimeConfig::builder()
             .with("rr-ttl-max 66")
             .with("rr-ttl-min 55")
             .with("rr-ttl-reply-max 30")
@@ -308,7 +307,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ttl_clip_ttl_max_reply_ip_num() -> Result<(), DnsError> {
-        let cfg = SmartDnsConfig::builder()
+        let cfg = RuntimeConfig::builder()
             .with("rr-ttl-max 66")
             .with("rr-ttl-min 55")
             .with("rr-ttl-reply-max 30")
@@ -347,7 +346,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ttl_clip_ttl_max_reply_ip_num_1() -> Result<(), DnsError> {
-        let cfg = SmartDnsConfig::builder()
+        let cfg = RuntimeConfig::builder()
             .with("rr-ttl-max 66")
             .with("rr-ttl-min 55")
             .with("rr-ttl-reply-max 30")
@@ -374,7 +373,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_ttl_clip_ttl_max_reply_ip_num_2() -> Result<(), DnsError> {
-        let cfg = SmartDnsConfig::builder()
+        let cfg = RuntimeConfig::builder()
             .with("rr-ttl-max 66")
             .with("rr-ttl-min 55")
             .with("rr-ttl-reply-max 30")
