@@ -1,0 +1,19 @@
+FROM alpine:3.17 as smartdns-builder
+LABEL previous-stage=smartdns
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && \
+    apk add git patch gcc curl && \
+    git clone https://github.com/mokeyish/smartdns-rs.git /smartdns-rs
+# COPY ./Cargo.toml.patch /smartdns-rs
+RUN cd /smartdns-rs && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+    apk add libc-dev && \
+    . ~/.cargo/env && rustup target add x86_64-unknown-linux-musl && \
+    RUSTFLAGS="-C linker=gcc -C target-feature=+crt-static" cargo build --release --target=x86_64-unknown-linux-musl
+
+FROM alpine:3.17
+ENV TZ="Asia/Shanghai"
+COPY --from=smartdns-builder /smartdns-rs/target/x86_64-unknown-linux-musl/release/smartdns /usr/sbin/
+EXPOSE 53/udp 53/tcp
+VOLUME "/etc/smartdns/"
+HEALTHCHECK --interval=5m CMD test `nslookup dns.pub 127.0.0.1 |grep answer |wc -l` -gt 0
+CMD ["/usr/sbin/smartdns", "run", "-c", "/etc/smartdns/smartdns.conf", "-d", "-p", "-"]
