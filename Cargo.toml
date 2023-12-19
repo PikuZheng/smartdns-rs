@@ -73,7 +73,7 @@ enum_dispatch = "0.3.12"
 
 
 # api
-axum = { version = "0.6.16" }
+axum = { version = "0.6.16", features = ["hickory-proto"] }
 axum-server = { version = "0.5.1", features = ["tls-rustls"] }
 
 # serde
