@@ -73,7 +73,7 @@ enum_dispatch = "0.3.12"
 
 
 # api
-axum = { version = "0.6.16", features = ["hickory-proto"] }
+axum = { version = "0.6.16" }
 axum-server = { version = "0.5.1", features = ["tls-rustls"] }
 
 # serde
@@ -110,12 +110,12 @@ tracing-subscriber = { version = "0.3", features = [
 # tracing-appender = "0.2"
 
 # hickory dns
-hickory-proto = { version = "0.24" }
-hickory-resolver = { version = "0.24", features = [
+hickory-proto = { version = "0.24.0" }
+hickory-resolver = { version = "0.24.0", features = [
   "serde-config",
   "system-config",
 ] }
-hickory-server = { version = "0.24", features = ["resolver"] }
+hickory-server = { version = "0.24.0", features = ["resolver"] }
 
 # ssl
 webpki-roots = "0.25.2"
