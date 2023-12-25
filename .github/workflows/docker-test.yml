@@ -92,12 +92,12 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: docker/setup-qemu-action@v2
       - uses: docker/setup-buildx-action@v2
         with:
+          docker login --username=${{ secrets.DOCKER_USERNAME }} --password='${{ secrets.DOCKER_PASSWORD }}'
           install: true
       - name: create manifest
         run: |
+          docker login --username=${{ secrets.DOCKER_USERNAME }} --password='${{ secrets.DOCKER_PASSWORD }}'
           #docker manifest create pikuzheng/smartdns-rs:latest pikuzheng/smartdns-rs:latest-x86_64 pikuzheng/smartdns-rs:latest-i686 pikuzheng/smartdns-rs:latest-aarch64 pikuzheng/smartdns-rs:latest-ppc64le pikuzheng/smartdns-rs:latest-armv7
-          docker manifest create pikuzheng/smartdns-rs:latest pikuzheng/smartdns-rs:latest-x86_64 pikuzheng/smartdns-rs:latest-i686 pikuzheng/smartdns-rs:latest-aarch64 pikuzheng/smartdns-rs:latest-armv7
-          docker manifest push pikuzheng/smartdns-rs:latest
+          docker buildx imagetools create -t pikuzheng/smartdns-rs:latest pikuzheng/smartdns-rs:latest-x86_64 pikuzheng/smartdns-rs:latest-i686 pikuzheng/smartdns-rs:latest-aarch64 pikuzheng/smartdns-rs:latest-armv7
