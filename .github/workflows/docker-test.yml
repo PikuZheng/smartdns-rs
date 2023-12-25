@@ -88,6 +88,7 @@ jobs:
   create manifest:
     name: create docker manifest
     needs: build
+    steps:
       - uses: docker/setup-qemu-action@v2
       - uses: docker/setup-buildx-action@v2
         with:
