@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - master
+      - main
       
 jobs:
   build: 
@@ -82,6 +82,8 @@ jobs:
           docker login --username=${{ secrets.DOCKER_USERNAME }} --password='${{ secrets.DOCKER_PASSWORD }}'
           if  test "$GOARCH" = "i686" ;then
             docker buildx build --no-cache --platform linux/386 --push -t pikuzheng/smartdns-rs:latest-$GOARCH -f Dockerfile.unknown .
+          elif  test "$GOARCH" = "armv7" ;then
+            docker buildx build --no-cache --platform linux/arm/v7 --push -t pikuzheng/smartdns-rs:latest-$GOARCH -f Dockerfile.unknown .
           else
             docker buildx build --no-cache --platform linux/$GOARCH --push -t pikuzheng/smartdns-rs:latest-$GOARCH -f Dockerfile.unknown .
           fi
