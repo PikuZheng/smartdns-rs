@@ -85,7 +85,7 @@ jobs:
           else
             docker buildx build --no-cache --platform linux/$GOARCH --push -t pikuzheng/smartdns-rs:latest-$GOARCH -f Dockerfile.unknown .
           fi
-  create manifest:
+  create-manifest:
     name: create docker manifest
     needs: build
     runs-on: ubuntu-latest
