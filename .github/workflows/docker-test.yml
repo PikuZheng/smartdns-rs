@@ -1,0 +1,102 @@
+name: Docker Image test CI
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      
+jobs:
+  build: 
+    strategy:
+      matrix:
+        #goarch: [x86_64, powerpc64le, mipsel, mips, mips64el, mips64, i686, aarch64, armv7, s390x]
+        goarch: [x86_64, i686, aarch64, armv7]
+      fail-fast: false
+    runs-on: ubuntu-latest
+    env:
+      GOARCH: ${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: docker/setup-qemu-action@v2
+      - uses: docker/setup-buildx-action@v2
+        with:
+          install: true
+      - name: patch
+        run: |
+          cd ${{ github.workspace }}
+          mkdir -p openssl
+          curl -sSL https://github.com/openssl/openssl/archive/refs/tags/openssl-3.2.0.tar.gz -o openssl.tar.gz
+          tar -zxvf openssl.tar.gz --strip-components 1 -C openssl
+          cat >> docker-patch.sh << EOF
+          apk add openssl3-dev openssl-libs-static build-base musl-dev curl git
+          cd /workdir
+          cargo install patch-crate 
+          cargo patch-crate --force
+          EOF
+          docker run -i --rm -v ${{ github.workspace }}:/workdir rust:alpine3.18 sh /workdir/docker-patch.sh
+      - name: Build
+        run: |
+          rm docker-build.sh || true
+          rm docker-openssl.sh || true
+          cat >> docker-openssl.sh << EOF
+          apk add perl make coreutils tar pkgconfig dpkg binutils
+          cd /workdir/openssl
+          if [ "$GOARCH" == "mipsel" ] || [ "$GOARCH" == "mips" ] ;then
+            ./Configure no-tests linux-mips32
+          elif [ "$GOARCH" == "mips64el" ] || [ "$GOARCH" == "mips64" ] ;then
+            ./Configure no-tests linux-mips64
+          elif [ "$GOARCH" == "i686" ] ;then
+            ./Configure no-tests linux-x86
+          elif [ "$GOARCH" == "powerpc64le" ] ;then
+            ./Configure no-tests linux-ppc64le
+          elif [ "$GOARCH" == "armv7" ] ;then
+            ./Configure no-tests linux-armv4
+          else
+           ./Configure no-tests linux-$GOARCH
+          fi
+          make clean && make all
+          EOF
+          cat >> docker-build.sh << EOF
+          cd /workdir
+          export OPENSSL_DIR=/workdir/openssl
+          export OPENSSL_LIB_DIR="/workdir/openssl"
+          export OPENSSL_INCLUDE_DIR="/workdir/openssl/include"
+          if  test "$GOARCH" = "armv7" ;then
+            cargo build --release --target=armv7-unknown-linux-musleabi
+            cp ./target/armv7-unknown-linux-musleabi/release/smartdns ./
+          elif  test "$GOARCH" = "mips64" || test "$GOARCH" = "mips64el" ;then
+            cargo build --release --target=$GOARCH-unknown-linux-muslabi64
+            cp ./target/armv7-unknown-linux-musleabi/release/smartdns ./
+          else
+            cargo build --release --target=$GOARCH-unknown-linux-musl
+            cp ./target/$GOARCH-unknown-linux-musl/release/smartdns ./
+          fi
+          EOF
+          if  test "$GOARCH" = "armv7" ;then
+            docker run -i --rm -v ${{ github.workspace }}:/workdir muslcc/x86_64:armv7l-linux-musleabihf sh /workdir/docker-openssl.sh
+            docker run -i --rm -v ${{ github.workspace }}:/workdir messense/rust-musl-cross:armv7-musleabi sh /workdir/docker-build.sh
+          else
+            docker run -i --rm -v ${{ github.workspace }}:/workdir muslcc/x86_64:$GOARCH-linux-musl sh /workdir/docker-openssl.sh
+            docker run -i --rm -v ${{ github.workspace }}:/workdir messense/rust-musl-cross:$GOARCH-musl sh /workdir/docker-build.sh
+          fi
+          docker login --username=${{ secrets.DOCKER_USERNAME }} --password='${{ secrets.DOCKER_PASSWORD }}'
+          if  test "$GOARCH" = "i686" ;then
+            docker buildx build --no-cache --platform linux/386 --push -t pikuzheng/smartdns-rs:latest-$GOARCH -f Dockerfile.unknown .
+          elif  test "$GOARCH" = "armv7" ;then
+            docker buildx build --no-cache --platform linux/arm/v7 --push -t pikuzheng/smartdns-rs:latest-$GOARCH -f Dockerfile.unknown .
+          else
+            docker buildx build --no-cache --platform linux/$GOARCH --push -t pikuzheng/smartdns-rs:latest-$GOARCH -f Dockerfile.unknown .
+          fi
+  create-manifest:
+    name: create docker manifest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v2
+        with:
+          install: true
+      - name: create manifest
+        run: |
+          docker login --username=${{ secrets.DOCKER_USERNAME }} --password='${{ secrets.DOCKER_PASSWORD }}'
+          #docker manifest create pikuzheng/smartdns-rs:latest pikuzheng/smartdns-rs:latest-x86_64 pikuzheng/smartdns-rs:latest-i686 pikuzheng/smartdns-rs:latest-aarch64 pikuzheng/smartdns-rs:latest-ppc64le pikuzheng/smartdns-rs:latest-armv7
+          docker buildx imagetools create -t pikuzheng/smartdns-rs:latest pikuzheng/smartdns-rs:latest-x86_64 pikuzheng/smartdns-rs:latest-i686 pikuzheng/smartdns-rs:latest-aarch64 pikuzheng/smartdns-rs:latest-armv7
