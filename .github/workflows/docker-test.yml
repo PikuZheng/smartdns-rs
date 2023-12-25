@@ -94,7 +94,6 @@ jobs:
     steps:
       - uses: docker/setup-buildx-action@v2
         with:
-          docker login --username=${{ secrets.DOCKER_USERNAME }} --password='${{ secrets.DOCKER_PASSWORD }}'
           install: true
       - name: create manifest
         run: |
