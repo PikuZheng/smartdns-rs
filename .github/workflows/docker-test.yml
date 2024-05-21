@@ -10,7 +10,7 @@ jobs:
     strategy:
       matrix:
         #goarch: [x86_64, powerpc64le, mipsel, mips, mips64el, mips64, i686, aarch64, armv7, s390x]
-        goarch: [x86_64, i686, aarch64, armv7]
+        goarch: [x86_64, i686, aarch64, armv7, mips, mips64, powerpc64le]
       fail-fast: false
     runs-on: ubuntu-latest
     env:
@@ -99,4 +99,4 @@ jobs:
         run: |
           docker login --username=${{ secrets.DOCKER_USERNAME }} --password='${{ secrets.DOCKER_PASSWORD }}'
           #docker manifest create pikuzheng/smartdns-rs:latest pikuzheng/smartdns-rs:latest-x86_64 pikuzheng/smartdns-rs:latest-i686 pikuzheng/smartdns-rs:latest-aarch64 pikuzheng/smartdns-rs:latest-ppc64le pikuzheng/smartdns-rs:latest-armv7
-          docker buildx imagetools create -t pikuzheng/smartdns-rs:latest pikuzheng/smartdns-rs:latest-x86_64 pikuzheng/smartdns-rs:latest-i686 pikuzheng/smartdns-rs:latest-aarch64 pikuzheng/smartdns-rs:latest-armv7
+          docker buildx imagetools create -t pikuzheng/smartdns-rs:latest pikuzheng/smartdns-rs:latest-x86_64 pikuzheng/smartdns-rs:latest-i686 pikuzheng/smartdns-rs:latest-aarch64 pikuzheng/smartdns-rs:latest-armv7 pikuzheng/smartdns-rs:latest-ppc64le pikuzheng/smartdns-rs:latest-mips pikuzheng/smartdns-rs:latest-mips64
