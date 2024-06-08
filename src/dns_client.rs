@@ -10,6 +10,7 @@ use std::{
 use crate::{
     dns::DnsResponse,
     libdns::proto::rr::rdata::opt::{ClientSubnet, EdnsOption},
+    log,
 };
 use tokio::sync::RwLock;
 
@@ -605,9 +606,7 @@ impl NameServerFactory {
                 info.blacklist_ip,
                 info.whitelist_ip,
                 info.check_edns,
-                info.edns_client_subnet
-                    .map(|x| x.into())
-                    .or(default_client_subnet),
+                info.subnet.map(|x| x.into()).or(default_client_subnet),
                 resolver.options().clone(),
             );
 
@@ -694,6 +693,13 @@ impl GenericResolver for NameServer {
         let query = Query::query(name, options.record_type);
 
         let client_subnet = options.client_subnet.or(self.opts.client_subnet);
+
+        log::debug!(
+            "query name: {} type: {}, {:?}",
+            query.name(),
+            query.query_type(),
+            client_subnet
+        );
 
         let req = DnsRequest::new(
             build_message(query, request_options, client_subnet, options.is_dnssec),
