@@ -213,8 +213,14 @@ impl RuntimeConfig {
 
     /// hosts file path
     #[inline]
-    pub fn hosts_file(&self) -> Option<&Path> {
-        self.hosts_file.as_deref()
+    pub fn hosts_file(&self) -> Option<&glob::Pattern> {
+        self.hosts_file.as_ref()
+    }
+
+    /// Whether to expand the address record corresponding to PTR record
+    #[inline]
+    pub fn expand_ptr_from_address(&self) -> bool {
+        self.expand_ptr_from_address.unwrap_or_default()
     }
 
     /// whether resolv mdns
@@ -775,6 +781,7 @@ impl RuntimeConfigBuilder {
                 CacheFile(v) => self.cache.file = Some(v),
                 CachePersist(v) => self.cache.persist = Some(v),
                 CName(v) => self.cnames.push(v),
+                ExpandPtrFromAddress(v) => self.expand_ptr_from_address = Some(v),
                 NftSet(config) => self.nftsets.push(config),
                 Server(server) => self.nameservers.push(server),
                 ResponseMode(mode) => self.response_mode = Some(mode),
@@ -1116,7 +1123,7 @@ mod tests {
     #[test]
     fn test_config_domain_rules_without_args() {
         let mut cfg = RuntimeConfig::builder();
-        cfg.config("domain-set -name domain-forwarding-list -file tests/test_confs/block-list.txt");
+        cfg.config("domain-set -name domain-forwarding-list -file tests/test_data/block-list.txt");
         cfg.config("domain-rules /domain-set:domain-forwarding-list/");
         assert!(cfg.address_rules.last().is_none());
     }
@@ -1435,7 +1442,7 @@ mod tests {
 
     #[test]
     fn test_parse_load_config_file_b() {
-        let cfg = RuntimeConfig::load_from_file("tests/test_confs/b_main.conf");
+        let cfg = RuntimeConfig::load_from_file("tests/test_data/b_main.conf");
 
         assert_eq!(cfg.server_name, "SmartDNS123".parse().ok());
         assert_eq!(
@@ -1459,7 +1466,7 @@ mod tests {
     #[test]
     #[cfg(failed_tests)]
     fn test_domain_set() {
-        let cfg = RuntimeConfig::load_from_file("tests/test_confs/b_main.conf");
+        let cfg = RuntimeConfig::load_from_file("tests/test_data/b_main.conf");
 
         assert!(!cfg.domain_sets.is_empty());
 

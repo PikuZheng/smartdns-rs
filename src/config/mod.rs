@@ -70,7 +70,9 @@ pub struct Config {
     /// whether resolv local hostname to ip address
     pub resolv_hostname: Option<bool>,
 
-    pub hosts_file: Option<PathBuf>,
+    pub hosts_file: Option<glob::Pattern>,
+
+    pub expand_ptr_from_address: Option<bool>,
 
     /// dns server run user
     ///
