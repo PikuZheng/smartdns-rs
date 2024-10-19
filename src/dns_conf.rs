@@ -345,6 +345,12 @@ impl RuntimeConfig {
         self.force_aaaa_soa.unwrap_or_default()
     }
 
+    /// force HTTPS query return SOA
+    #[inline]
+    pub fn force_https_soa(&self) -> bool {
+        self.force_https_soa.unwrap_or_default()
+    }
+
     /// force specific qtype return soa
     #[inline]
     pub fn force_qtype_soa(&self) -> &HashSet<RecordType> {
@@ -803,6 +809,7 @@ impl RuntimeConfigBuilder {
                 ServeExpired(v) => self.cache.serve_expired = Some(v),
                 PrefetchDomain(v) => self.cache.prefetch_domain = Some(v),
                 ForceAAAASOA(v) => self.force_aaaa_soa = Some(v),
+                ForceHTTPSSOA(v) => self.force_https_soa = Some(v),
                 DualstackIpAllowForceAAAA(v) => self.dualstack_ip_allow_force_aaaa = Some(v),
                 DualstackIpSelection(v) => self.dualstack_ip_selection = Some(v),
                 ServerName(v) => self.server_name = Some(v),
@@ -1166,7 +1173,7 @@ mod tests {
             Domain::Name("test.example.com".parse().unwrap())
         );
 
-        assert_eq!(domain_addr_rule.address, DomainAddress::SOA);
+        assert_eq!(domain_addr_rule.address, AddressRuleValue::SOA);
     }
 
     #[test]
@@ -1190,7 +1197,7 @@ mod tests {
             Domain::Name("test.example.com".parse().unwrap())
         );
 
-        assert_eq!(domain_addr_rule.address, DomainAddress::SOAv4);
+        assert_eq!(domain_addr_rule.address, AddressRuleValue::SOAv4);
     }
 
     #[test]
@@ -1206,7 +1213,7 @@ mod tests {
             Domain::Name("test.example.com".parse().unwrap())
         );
 
-        assert_eq!(domain_addr_rule.address, DomainAddress::SOAv6);
+        assert_eq!(domain_addr_rule.address, AddressRuleValue::SOAv6);
     }
 
     #[test]
@@ -1222,7 +1229,7 @@ mod tests {
             Domain::Name("test.example.com".parse().unwrap())
         );
 
-        assert_eq!(domain_addr_rule.address, DomainAddress::IGN);
+        assert_eq!(domain_addr_rule.address, AddressRuleValue::IGN);
     }
 
     #[test]
@@ -1238,7 +1245,7 @@ mod tests {
             Domain::Name("test.example.com".parse().unwrap())
         );
 
-        assert_eq!(domain_addr_rule.address, DomainAddress::IGNv4);
+        assert_eq!(domain_addr_rule.address, AddressRuleValue::IGNv4);
     }
 
     #[test]
@@ -1254,7 +1261,7 @@ mod tests {
             Domain::Name("test.example.com".parse().unwrap())
         );
 
-        assert_eq!(domain_addr_rule.address, DomainAddress::IGNv6);
+        assert_eq!(domain_addr_rule.address, AddressRuleValue::IGNv6);
     }
 
     #[test]
@@ -1266,14 +1273,14 @@ mod tests {
 
         assert_eq!(
             cfg.find_domain_rule(&"cloudflare.com".parse().unwrap())
-                .get(|n| n.address),
-            Some(DomainAddress::SOA)
+                .get(|n| n.address.clone()),
+            Some(AddressRuleValue::SOA)
         );
 
         assert_eq!(
             cfg.find_domain_rule(&"google.com".parse().unwrap())
-                .get(|n| n.address),
-            Some(DomainAddress::IGN)
+                .get(|n| n.address.clone()),
+            Some(AddressRuleValue::IGN)
         );
     }
 
@@ -1284,13 +1291,13 @@ mod tests {
             .build();
         assert_eq!(
             cfg.find_domain_rule(&"example.com".parse().unwrap())
-                .get(|n| n.address),
-            Some(DomainAddress::SOA)
+                .get(|n| n.address.clone()),
+            Some(AddressRuleValue::SOA)
         );
 
         assert_eq!(
             cfg.find_domain_rule(&"aa.example.com".parse().unwrap())
-                .get(|n| n.address),
+                .get(|n| n.address.clone()),
             None
         );
     }
@@ -1300,13 +1307,13 @@ mod tests {
         let cfg = RuntimeConfig::builder().with("address /*/#").build();
         assert_eq!(
             cfg.find_domain_rule(&"localhost".parse().unwrap())
-                .get(|n| n.address),
-            Some(DomainAddress::SOA)
+                .get_ref(|n| n.address.as_ref()),
+            Some(&AddressRuleValue::SOA)
         );
 
         assert_eq!(
             cfg.find_domain_rule(&"aa.example.com".parse().unwrap())
-                .get(|n| n.address),
+                .get(|n| n.address.clone()),
             None
         );
     }
@@ -1316,14 +1323,14 @@ mod tests {
         let cfg = RuntimeConfig::builder().with("address /+/#").build();
         assert_eq!(
             cfg.find_domain_rule(&"localhost".parse().unwrap())
-                .get(|n| n.address),
-            Some(DomainAddress::SOA)
+                .get(|n| n.address.clone()),
+            Some(AddressRuleValue::SOA)
         );
 
         assert_eq!(
             cfg.find_domain_rule(&"aa.example.com".parse().unwrap())
-                .get(|n| n.address),
-            Some(DomainAddress::SOA)
+                .get(|n| n.address.clone()),
+            Some(AddressRuleValue::SOA)
         );
     }
 
@@ -1332,14 +1339,14 @@ mod tests {
         let cfg = RuntimeConfig::builder().with("address /./#").build();
         assert_eq!(
             cfg.find_domain_rule(&"localhost".parse().unwrap())
-                .get(|n| n.address),
-            Some(DomainAddress::SOA)
+                .get(|n| n.address.clone()),
+            Some(AddressRuleValue::SOA)
         );
 
         assert_eq!(
             cfg.find_domain_rule(&"aa.example.com".parse().unwrap())
-                .get(|n| n.address),
-            Some(DomainAddress::SOA)
+                .get(|n| n.address.clone()),
+            Some(AddressRuleValue::SOA)
         );
     }
 
@@ -1370,7 +1377,10 @@ mod tests {
         assert_eq!(domain_rule.domain, Domain::Name("doh.pub".parse().unwrap()));
         assert_eq!(
             domain_rule.address,
-            Some(DomainAddress::IPv4("127.0.0.1".parse().unwrap()))
+            Some(AddressRuleValue::Addr {
+                v4: Some(["127.0.0.1".parse().unwrap()].into()),
+                v6: None
+            })
         );
         assert_eq!(
             domain_rule.speed_check_mode,
@@ -1391,7 +1401,10 @@ mod tests {
         assert_eq!(domain_rule.domain, Domain::Name("doh.pub".parse().unwrap()));
         assert_eq!(
             domain_rule.address,
-            Some(DomainAddress::IPv4("127.0.0.1".parse().unwrap()))
+            Some(AddressRuleValue::Addr {
+                v4: Some(["127.0.0.1".parse().unwrap()].into()),
+                v6: None
+            })
         );
         assert_eq!(
             domain_rule.speed_check_mode,
@@ -1410,7 +1423,7 @@ mod tests {
         let domain_rule = cfg.find_domain_rule(&"doh.pub".parse().unwrap()).unwrap();
 
         assert_eq!(domain_rule.name(), &"doh.pub".parse().unwrap());
-        assert_eq!(domain_rule.address, Some(DomainAddress::SOA));
+        assert_eq!(domain_rule.address, Some(AddressRuleValue::SOA));
         assert_eq!(
             domain_rule.speed_check_mode,
             Some(vec![SpeedCheckMode::Ping].into())

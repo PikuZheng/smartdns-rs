@@ -3,6 +3,7 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     str::FromStr,
+    sync::Arc,
 };
 
 use crate::{
@@ -145,6 +146,11 @@ pub struct Config {
     ///
     /// force-AAAA-SOA [yes|no]
     pub force_aaaa_soa: Option<bool>,
+
+    /// force HTTPS query return SOA
+    ///
+    /// force-HTTPS-SOA [yes|no]
+    pub force_https_soa: Option<bool>,
 
     /// force specific qtype return soa
     ///
@@ -301,21 +307,23 @@ pub struct SslConfig {
 }
 
 #[allow(clippy::upper_case_acronyms)]
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
-pub enum DomainAddress {
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub enum AddressRuleValue {
     SOA,
     SOAv4,
     SOAv6,
     IGN,
     IGNv4,
     IGNv6,
-    IPv4(Ipv4Addr),
-    IPv6(Ipv6Addr),
+    Addr {
+        v4: Option<Arc<[Ipv4Addr]>>,
+        v6: Option<Arc<[Ipv6Addr]>>,
+    },
 }
 
-impl std::fmt::Display for DomainAddress {
+impl std::fmt::Display for AddressRuleValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use DomainAddress::*;
+        use AddressRuleValue::*;
         match self {
             SOA => write!(f, "#"),
             SOAv4 => write!(f, "#4"),
@@ -323,8 +331,30 @@ impl std::fmt::Display for DomainAddress {
             IGN => write!(f, "-"),
             IGNv4 => write!(f, "-4"),
             IGNv6 => write!(f, "-6"),
-            IPv4(ip) => write!(f, "{ip}"),
-            IPv6(ip) => write!(f, "{ip}"),
+            Addr { v4, v6 } => {
+                let mut first = true;
+                if let Some(v4) = v4 {
+                    for ip in v4.iter() {
+                        if first {
+                            first = false;
+                        } else {
+                            write!(f, ",")?;
+                        }
+                        write!(f, "{}", ip)?;
+                    }
+                }
+                if let Some(v6) = v6 {
+                    for ip in v6.iter() {
+                        if first {
+                            first = false;
+                        } else {
+                            write!(f, ",")?;
+                        }
+                        write!(f, "{}", ip)?;
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -344,7 +374,7 @@ pub struct AddressRule {
     #[serde(with = "serde_str")]
     pub domain: Domain,
     #[serde(with = "serde_str")]
-    pub address: DomainAddress,
+    pub address: AddressRuleValue,
 }
 
 /// alias: nameserver rules
@@ -384,4 +414,4 @@ macro_rules! impl_from_str {
     };
 }
 
-impl_from_str!(AddressRule, Domain, DomainAddress, ListenerAddress);
+impl_from_str!(AddressRule, Domain, AddressRuleValue, ListenerAddress);
