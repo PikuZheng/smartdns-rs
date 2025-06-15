@@ -1,11 +1,9 @@
-FROM rust:alpine3.22 as smartdns-builder
+FROM messense/rust-musl-cross:x86_64-musl as smartdns-builder
 LABEL previous-stage=smartdns
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && \
-    apk add s musl-dev openssl-dev openssl-libs-static && \
-    git clone https://github.com/mokeyish/smartdns-rs.git /smartdns-rs && \
+RUN git clone https://github.com/mokeyish/smartdns-rs.git /smartdns-rs && \
     cd /smartdns-rs && \
-    cargo install patch-crate && cargo patch-crate && \
-    RUSTFLAGS="-C linker=gcc -C target-feature=+crt-static" cargo build --release --target=x86_64-unknown-linux-musl
+    RUSTFLAGS="-C linker=gcc -C target-feature=+crt-static" cargo build --release --target=x86_64-unknown-linux-musl --no-default-features --features default && \
+    musl-strip -s /smartdns-rs/target/x86_64-unknown-linux-musl/release/smartdns
 
 FROM alpine:3.22
 ENV TZ="Asia/Shanghai"
