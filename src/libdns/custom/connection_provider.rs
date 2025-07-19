@@ -1,5 +1,6 @@
 use crate::dns_client::{BootstrapResolver, GenericResolverExt};
 use crate::dns_url::{DnsUrl, Host, HttpsPrefer, ProtocolConfig};
+use crate::libdns::custom::warmup::DnsHandleWarmpup;
 use crate::log;
 use crate::proxy::{self, ProxyConfig};
 use crate::proxy::{TcpStream, UdpSocket};
@@ -23,10 +24,7 @@ use crate::libdns::{
             QuicSocketBinder, RuntimeProvider as _, Spawn, TokioHandle, TokioTime,
             iocompat::AsyncIoTokioAsStd,
         },
-        xfer::{
-            DnsExchange, DnsExchangeConnect, DnsHandle, DnsMultiplexer, DnsMultiplexerConnect,
-            FirstAnswer,
-        },
+        xfer::{DnsExchange, DnsExchangeConnect, DnsMultiplexer, DnsMultiplexerConnect},
     },
     resolver::config::{ConnectionConfig, ResolverOpts},
 };
@@ -41,19 +39,6 @@ type ConnectionFuture = Pin<Box<dyn Send + Future<Output = Result<DnsExchange, P
 
 static FAKE_SERVER_CONFIG: std::sync::LazyLock<NameServerConfig> =
     std::sync::LazyLock::new(|| NameServerConfig::udp(Ipv4Addr::UNSPECIFIED.into()));
-
-static DEFAULT_QUERY: std::sync::LazyLock<crate::libdns::proto::xfer::DnsRequest> =
-    std::sync::LazyLock::new(|| {
-        use crate::libdns::proto::{
-            op::{Message, Query},
-            rr::RecordType,
-            xfer::DnsRequest,
-        };
-        let query = Query::query("example.com.".parse().unwrap(), RecordType::A);
-        let mut message = Message::query();
-        message.add_query(query);
-        DnsRequest::new(message, Default::default())
-    });
 
 #[derive(Clone)]
 pub struct ConnectionProvider {
@@ -111,7 +96,7 @@ impl crate::libdns::resolver::name_server::ConnectionProvider for ConnectionProv
         Ok(async move {
             let bind_addr = None;
 
-            let ip_addrs = match server.host() {
+            let ip_addrs: StackVec<_> = match server.host() {
                 Host::Domain(domain) => {
                     match server.get_param::<IpAddr>("ip") {
                         Some(ip) => smallvec![ip],
@@ -127,7 +112,7 @@ impl crate::libdns::resolver::name_server::ConnectionProvider for ConnectionProv
                                 Ok(lookup_ip) => lookup_ip.ip_addrs().into_iter().collect(),
                                 Err(err) => {
                                     log::warn!("lookup ip: {domain} failed, {err}");
-                                    StackVec::new()
+                                    smallvec![]
                                 }
                             };
 
@@ -155,23 +140,24 @@ impl crate::libdns::resolver::name_server::ConnectionProvider for ConnectionProv
                 return Ok(conn);
             }
 
-            let server_addrs: Stack2xVec<_> = if let ProtocolConfig::Https { prefer, path, .. } = server.proto() {
-                let h3_proto = ProtocolConfig::H3 {
-                    path: path.clone(),
-                    disable_grease: false,
-                };
-                let delay_h2 = *prefer == HttpsPrefer::H3;
-                server_addrs.into_iter().flat_map(|server_addr|{
-                    let h2_server = server.clone();
-                    let mut h3_server = server.clone();
-                    h3_server.set_proto(h3_proto.clone());
-                    smallvec_inline![
-                        (h3_server, server_addr, false),
-                        (h2_server, server_addr, delay_h2),
-                    ]
-                }).collect()
-            } else {
-                server_addrs.into_iter().map(|server_addr|(server.clone(), server_addr, false)).collect()
+            let server_addrs: Stack2xVec<_> = match server.proto() {
+                ProtocolConfig::Https { prefer, path, .. } if *prefer != HttpsPrefer::H2 => {
+                    let h3_proto = ProtocolConfig::H3 {
+                        path: path.clone(),
+                        disable_grease: false,
+                    };
+                    let delay_h2 = *prefer == HttpsPrefer::H3;
+                    server_addrs.into_iter().flat_map(|server_addr|{
+                        let h2_server = server.clone();
+                        let mut h3_server = server.clone();
+                        h3_server.set_proto(h3_proto.clone());
+                        smallvec_inline![
+                            (h3_server, server_addr, false),
+                            (h2_server, server_addr, delay_h2),
+                        ]
+                    }).collect()
+                },
+                _ => server_addrs.into_iter().map(|server_addr|(server.clone(), server_addr, false)).collect()
             };
 
             let conns = server_addrs.into_iter().map(|(server, server_addr, delay)| {
@@ -181,7 +167,7 @@ impl crate::libdns::resolver::name_server::ConnectionProvider for ConnectionProv
                 async move {
                     let conn = new_connection(&server, server_addr, bind_addr, &options, runtime_proviver).await?;
 
-                    let ok = conn.send(DEFAULT_QUERY.clone()).first_answer().await.is_ok();
+                    let ok = conn.warmup().await.is_ok();
 
                     if !ok {
                         tokio::time::sleep(Duration::from_secs(1)).await;
